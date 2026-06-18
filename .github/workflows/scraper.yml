@@ -1,24 +1,17 @@
 # ============================================================
-#  .github/workflows/scraper.yml
-#
-#  Runs the scraper every 2 hours on GitHub's free servers.
-#  Free tier: 2,000 minutes/month on private repos,
-#             unlimited on public repos.
-#
-#  The SQLite database is persisted between runs using
-#  GitHub Actions Cache — so you don't lose collected data.
+#  .github/workflows/scraper.yml  —  FIXED VERSION
 # ============================================================
 
 name: 🤖 Viral Content Scraper
 
 on:
   schedule:
-    - cron: '0 */2 * * *'    # every 2 hours, on the hour
+    - cron: '0 */2 * * *'    # every 2 hours
 
-  workflow_dispatch:           # lets you trigger manually from GitHub UI
+  workflow_dispatch:           # manual trigger from GitHub UI
     inputs:
       source:
-        description: 'Scrape a single source (leave blank for all)'
+        description: 'Scrape one source only (blank = all)'
         required: false
         default: ''
         type: choice
@@ -33,77 +26,108 @@ jobs:
   scrape:
     name: Run scrapers
     runs-on: ubuntu-latest
-    timeout-minutes: 15       # kill the job if it hangs
+    timeout-minutes: 15
 
     steps:
-      # ── 1. Checkout code ─────────────────────────────────────
+      # 1. Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Set up Python ──────────────────────────────────────
+      # 2. Python setup
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'         # caches pip downloads between runs
+          cache: 'pip'
 
-      # ── 3. Install dependencies ───────────────────────────────
+      # 3. Install deps
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Restore database from cache ───────────────────────
-      #   This is how we persist the SQLite DB between runs.
-      #   Cache key includes the date so it rotates monthly.
+      # 4. Restore cached DB (persists data between runs)
       - name: Restore database cache
+        id: cache-db
         uses: actions/cache@v4
         with:
           path: data/posts.db
-          key: posts-db-${{ github.ref_name }}-${{ hashFiles('data/posts.db') }}
-          restore-keys: |
-            posts-db-${{ github.ref_name }}-
-            posts-db-
+          key: posts-db-${{ github.ref_name }}
+          restore-keys: posts-db-
 
-      # ── 5. Create required directories ───────────────────────
-      - name: Create directories
-        run: mkdir -p data logs
+      # 5. Create ALL required directories upfront
+      - name: Create required directories
+        run: |
+          mkdir -p data logs config scrapers
+          # Ensure __init__.py files exist (in case they're missing from repo)
+          touch config/__init__.py
+          touch data/__init__.py
+          touch scrapers/__init__.py
+          # Create empty log file so upload never fails
+          touch logs/scraper.log
 
-      # ── 6. Run the scraper ────────────────────────────────────
+      # 6. Verify structure before running (helps debug)
+      - name: Show project structure
+        run: |
+          echo "=== Project files ==="
+          find . -not -path './.git/*' -name "*.py" | sort
+          echo ""
+          echo "=== Python version ==="
+          python --version
+          echo ""
+          echo "=== Testing imports ==="
+          python -c "
+          import sys, os
+          sys.path.insert(0, '.')
+          from config.settings import KEYWORDS, TWITTER_ACCOUNTS
+          from data.database import init_db
+          init_db()
+          print('✓ All imports OK')
+          print(f'✓ {len(KEYWORDS)} keywords loaded')
+          print(f'✓ {len(TWITTER_ACCOUNTS)} Twitter accounts configured')
+          "
+
+      # 7. Run the scraper
       - name: Run scraper
         env:
           GROQ_API_KEY:   ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NTFY_TOPIC:     ${{ secrets.NTFY_TOPIC }}
         run: |
-          if [ -n "${{ github.event.inputs.source }}" ]; then
-            python run_scraper.py --source ${{ github.event.inputs.source }}
+          SOURCE="${{ github.event.inputs.source }}"
+          if [ -n "$SOURCE" ]; then
+            echo "Running single source: $SOURCE"
+            python run_scraper.py --source "$SOURCE"
           else
+            echo "Running all sources"
             python run_scraper.py
           fi
 
-      # ── 7. Show stats after run ────────────────────────────────
+      # 8. Show stats
       - name: Show collection stats
         run: python run_scraper.py --stats
 
-      # ── 8. Save database back to cache ───────────────────────
+      # 9. Save DB back to cache
       - name: Save database to cache
         uses: actions/cache@v4
         with:
           path: data/posts.db
-          key: posts-db-${{ github.ref_name }}-${{ hashFiles('data/posts.db') }}
+          key: posts-db-${{ github.ref_name }}
 
-      # ── 9. Upload DB as artifact (downloadable from GitHub UI) ─
-      - name: Upload database artifact
+      # 10. Upload DB snapshot (always, even on failure)
+      - name: Upload database snapshot
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: posts-database-${{ github.run_number }}
+          name: posts-db-run-${{ github.run_number }}
           path: data/posts.db
-          retention-days: 7    # keep last 7 days of DB snapshots
+          if-no-files-found: ignore    # ← won't fail if DB not created
+          retention-days: 7
 
-      # ── 10. Upload logs ───────────────────────────────────────
+      # 11. Upload logs (always, even on failure)
       - name: Upload logs
-        if: always()           # upload logs even if scraper failed
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scraper-logs-${{ github.run_number }}
-          path: logs/
+          name: logs-run-${{ github.run_number }}
+          path: logs/scraper.log
+          if-no-files-found: ignore    # ← won't fail if log is empty
           retention-days: 3
