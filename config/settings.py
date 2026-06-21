@@ -81,3 +81,17 @@ MAX_RETRIES      = 3
 
 # ── Scraper run interval (used in crontab comment only) ──────
 RUN_EVERY_HOURS  = 2
+
+# ── Phase 2: AI Scoring settings ─────────────────────────────
+GROQ_MODEL          = "openai/gpt-oss-20b"   # free, fast (llama-3.3-70b-versatile was deprecated Jun 2026)
+SCORING_BATCH_SIZE  = 30      # max posts to score per run (stay within free limits)
+SCORING_MIN_TOTAL   = 5.0     # posts below this total score get marked 'skipped'
+
+# Your niche description — used in the scoring prompt so the AI
+# knows what "relevant" means for YOUR audience specifically.
+NICHE_DESCRIPTION = (
+    "A student building in public, sharing AI tools, SaaS insights, "
+    "automation projects, and indie hacker / startup content. "
+    "Audience: developers, indie hackers, AI enthusiasts, students "
+    "interested in building side projects and startups."
+)

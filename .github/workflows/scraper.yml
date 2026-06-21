@@ -56,11 +56,12 @@ jobs:
       # 5. Create ALL required directories upfront
       - name: Create required directories
         run: |
-          mkdir -p data logs config scrapers
+          mkdir -p data logs config scrapers ai
           # Ensure __init__.py files exist (in case they're missing from repo)
           touch config/__init__.py
           touch data/__init__.py
           touch scrapers/__init__.py
+          touch ai/__init__.py
           # Create empty log file so upload never fails
           touch logs/scraper.log
 
@@ -79,8 +80,9 @@ jobs:
           sys.path.insert(0, '.')
           from config.settings import KEYWORDS, TWITTER_ACCOUNTS
           from data.database import init_db
+          from ai.scorer import score_posts, build_queue
           init_db()
-          print('✓ All imports OK')
+          print('✓ All imports OK (scrapers + AI scoring)')
           print(f'✓ {len(KEYWORDS)} keywords loaded')
           print(f'✓ {len(TWITTER_ACCOUNTS)} Twitter accounts configured')
           "

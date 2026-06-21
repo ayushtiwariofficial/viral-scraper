@@ -40,6 +40,7 @@ from scrapers.twitter_scraper  import scrape_twitter
 from scrapers.reddit_scraper   import scrape_reddit
 from scrapers.rss_scraper      import scrape_rss
 from scrapers.linkedin_scraper import scrape_linkedin
+from ai.scorer import score_posts, build_queue
 
 
 # ── Runner ────────────────────────────────────────────────────
@@ -89,13 +90,41 @@ def run_all(sources: list[str] = None) -> None:
     logger.info("")
 
 
+def run_scoring() -> None:
+    """Run Phase 2: AI scoring + queue building."""
+    logger.info("=" * 60)
+    logger.info("AI scoring started")
+    logger.info("=" * 60)
+
+    score_result = score_posts()
+    logger.info(
+        f"Scoring: {score_result.get('scored', 0)} scored, "
+        f"{score_result.get('skipped', 0)} skipped"
+    )
+
+    queue_result = build_queue()
+    logger.info(f"Queue: {queue_result.get('queued', 0)} posts ready for rewriting")
+    logger.info("")
+
+
 def show_stats() -> None:
+    from data.database import get_scoring_stats
+
     stats = get_stats()
     print("\n── Database stats ───────────────────────────")
     print(f"  Total posts stored  : {stats['total_posts']}")
     print(f"  Scraped today       : {stats['scraped_today']}")
     print(f"  In AI queue         : {stats['in_queue']}")
     print(f"  Posted to platforms : {stats['posted']}")
+
+    scoring = get_scoring_stats()
+    print("\n── AI scoring breakdown ──────────────────────")
+    print(f"  Raw (unscored)      : {scoring['raw']}")
+    print(f"  Scored              : {scoring['scored']}")
+    print(f"  Queued for rewrite  : {scoring['queued']}")
+    print(f"  Skipped (low score) : {scoring['skipped']}")
+    print(f"  Average total score : {scoring['avg_score']}")
+
     print("\n── Last 5 scraper runs ──────────────────────")
     for run in stats["recent_runs"]:
         status = f"❌ {run['error'][:50]}" if run.get("error") else "✓"
@@ -108,8 +137,10 @@ def show_stats() -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Viral content scraper")
-    parser.add_argument("--source",  help="Run a single source (twitter/reddit/rss/linkedin)")
-    parser.add_argument("--stats",   action="store_true", help="Show DB stats and exit")
+    parser.add_argument("--source",       help="Run a single scraper source (twitter/reddit/rss/linkedin)")
+    parser.add_argument("--stats",        action="store_true", help="Show DB stats and exit")
+    parser.add_argument("--score-only",   action="store_true", help="Run AI scoring only, skip scraping")
+    parser.add_argument("--skip-scoring", action="store_true", help="Run scrapers only, skip AI scoring step")
     args = parser.parse_args()
 
     # Always init DB first
@@ -119,12 +150,20 @@ def main():
         show_stats()
         return
 
+    if args.score_only:
+        run_scoring()
+        show_stats()
+        return
+
     sources = [args.source] if args.source else None
     run_all(sources)
 
-    # Always print stats at the end of a full run
-    if not args.source:
-        show_stats()
+    # Chain AI scoring right after scraping (unless explicitly skipped
+    # or only one source was requested via --source)
+    if not args.skip_scoring and not args.source:
+        run_scoring()
+
+    show_stats()
 
 
 if __name__ == "__main__":
