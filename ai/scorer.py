@@ -15,7 +15,6 @@ import re
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.env import GROQ_API_KEY
 from config.settings import TOP_POSTS_PER_RUN, REQUEST_DELAY, NICHE_DESCRIPTION
 from data.database import (
     get_unscored_posts, save_score, mark_skipped,
@@ -24,6 +23,11 @@ from data.database import (
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# Read directly from environment — works the same locally (via .env loaded
+# by python-dotenv, if you use it) and in GitHub Actions (via secrets.GROQ_API_KEY
+# passed as an env var in the workflow). No extra config file needed.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL   = "openai/gpt-oss-20b"   # fast + free; replaces deprecated llama-3.1-8b-instant (deprecated Jun 2026)
