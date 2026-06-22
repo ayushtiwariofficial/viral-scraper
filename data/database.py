@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS raw_posts (
     url           TEXT,
     engagement    INTEGER DEFAULT 0,         -- likes / upvotes / comments
     scraped_at    TEXT    NOT NULL,
-    status        TEXT    DEFAULT 'raw'      -- 'raw' | 'scored' | 'queued' | 'posted' | 'skipped'
+    status        TEXT    DEFAULT 'raw',     -- 'raw'|'scored'|'queued'|'rewritten'|'posted'|'skipped'|'rewrite_failed'
+    rewrite_attempts INTEGER DEFAULT 0       -- tracks retries to avoid infinite loops
 );
 
 -- Virality scores assigned by AI (Phase 2)
@@ -100,9 +101,19 @@ def get_db():
 # ── Init ──────────────────────────────────────────────────────
 
 def init_db():
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist, and migrate older DBs safely."""
     with get_db() as conn:
         conn.executescript(SCHEMA)
+
+        # Migration: add rewrite_attempts column if an older DB doesn't have it.
+        # (Safe to run every time — SQLite raises if the column already exists,
+        # so we just ignore that specific error.)
+        try:
+            conn.execute("ALTER TABLE raw_posts ADD COLUMN rewrite_attempts INTEGER DEFAULT 0")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+
     logger.info(f"Database ready at {DB_PATH}")
 
 
@@ -297,4 +308,127 @@ def get_scoring_stats() -> dict:
     return {
         "raw": raw, "scored": scored, "queued": queued, "skipped": skipped,
         "avg_score": round(avg_score, 2) if avg_score else 0,
+    }
+
+
+# ── Phase 3: Content rewriting helpers ────────────────────────
+
+def get_queued_posts_without_content(limit: int = 10, max_attempts: int = 3):
+    """
+    Fetch posts marked 'queued' that don't yet have a content_queue
+    entry — these are ready for Phase 3 rewriting. Excludes posts
+    that have already failed max_attempts times, so we don't burn
+    API quota retrying something that's permanently broken.
+    """
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT r.* FROM raw_posts r
+            WHERE r.status = 'queued'
+              AND r.rewrite_attempts < ?
+              AND r.id NOT IN (SELECT raw_post_id FROM content_queue)
+            ORDER BY r.id
+            LIMIT ?
+            """,
+            (max_attempts, limit)
+        ).fetchall()
+
+
+def record_rewrite_failure(raw_post_id: int, max_attempts: int = 3) -> None:
+    """
+    Increment a post's rewrite_attempts counter. Once it hits
+    max_attempts, mark it 'rewrite_failed' so it stops being
+    picked up by future runs.
+    """
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE raw_posts SET rewrite_attempts = rewrite_attempts + 1 WHERE id = ?",
+            (raw_post_id,)
+        )
+        row = conn.execute(
+            "SELECT rewrite_attempts FROM raw_posts WHERE id = ?",
+            (raw_post_id,)
+        ).fetchone()
+        if row and row["rewrite_attempts"] >= max_attempts:
+            conn.execute(
+                "UPDATE raw_posts SET status = 'rewrite_failed' WHERE id = ?",
+                (raw_post_id,)
+            )
+            logger.warning(f"Post {raw_post_id} gave up after {max_attempts} failed rewrite attempts")
+
+
+def save_rewritten_content(
+    raw_post_id: int,
+    twitter_thread: list[str],
+    linkedin_post: str,
+    hashtags: list[str],
+) -> int:
+    """
+    Save AI-rewritten content for a post and mark it 'rewritten'.
+    twitter_thread is stored as a JSON array; hashtags as comma-separated.
+    """
+    import json as _json
+
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO content_queue
+                (raw_post_id, twitter_thread, linkedin_post, hashtags, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                raw_post_id,
+                _json.dumps(twitter_thread),
+                linkedin_post,
+                ", ".join(hashtags),
+                datetime.utcnow().isoformat(),
+            )
+        )
+        conn.execute(
+            "UPDATE raw_posts SET status = 'rewritten' WHERE id = ?",
+            (raw_post_id,)
+        )
+    return cursor.lastrowid
+
+
+def get_unposted_content(limit: int = 10):
+    """Fetch rewritten content not yet posted to either platform (for Phase 4)."""
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT cq.*, r.source AS original_source, r.author AS original_author, r.url AS original_url
+            FROM content_queue cq
+            JOIN raw_posts r ON r.id = cq.raw_post_id
+            WHERE cq.posted_twitter = 0 OR cq.posted_linkedin = 0
+            ORDER BY cq.created_at
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+
+def get_rewrite_stats() -> dict:
+    """Quick breakdown of the rewriting pipeline status."""
+    with get_db() as conn:
+        queued_unwritten = conn.execute(
+            "SELECT COUNT(*) FROM raw_posts WHERE status='queued'"
+        ).fetchone()[0]
+        rewritten = conn.execute(
+            "SELECT COUNT(*) FROM raw_posts WHERE status='rewritten'"
+        ).fetchone()[0]
+        rewrite_failed = conn.execute(
+            "SELECT COUNT(*) FROM raw_posts WHERE status='rewrite_failed'"
+        ).fetchone()[0]
+        total_in_queue = conn.execute(
+            "SELECT COUNT(*) FROM content_queue"
+        ).fetchone()[0]
+        ready_to_post = conn.execute(
+            "SELECT COUNT(*) FROM content_queue WHERE posted_twitter=0 AND posted_linkedin=0"
+        ).fetchone()[0]
+    return {
+        "queued_awaiting_rewrite": queued_unwritten,
+        "rewritten": rewritten,
+        "rewrite_failed": rewrite_failed,
+        "total_in_content_queue": total_in_queue,
+        "ready_to_post": ready_to_post,
     }

@@ -95,3 +95,16 @@ NICHE_DESCRIPTION = (
     "Audience: developers, indie hackers, AI enthusiasts, students "
     "interested in building side projects and startups."
 )
+
+# ── Phase 3: AI Content Rewriting settings ───────────────────
+GEMINI_MODEL         = "gemini-2.5-flash"   # free tier, stable (gemini-2.0-flash deprecated/shutdown Jun 2026)
+REWRITE_BATCH_SIZE   = 10     # max posts to rewrite per run (Gemini free tier: 250 req/day on 2.5 Flash)
+
+# Your personal voice/brand — used so rewrites sound like YOU, not
+# a generic AI. Edit this to match your actual writing style.
+YOUR_VOICE = (
+    "A student building AI/SaaS side projects in public. Casual but "
+    "informative tone, no corporate jargon, occasional self-deprecating "
+    "humor, genuinely curious about the topic rather than salesy. "
+    "Uses simple words. Not afraid to share specific numbers or results."
+)

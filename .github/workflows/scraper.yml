@@ -81,8 +81,9 @@ jobs:
           from config.settings import KEYWORDS, TWITTER_ACCOUNTS
           from data.database import init_db
           from ai.scorer import score_posts, build_queue
+          from ai.rewriter import rewrite_posts
           init_db()
-          print('✓ All imports OK (scrapers + AI scoring)')
+          print('✓ All imports OK (scrapers + AI scoring + AI rewriting)')
           print(f'✓ {len(KEYWORDS)} keywords loaded')
           print(f'✓ {len(TWITTER_ACCOUNTS)} Twitter accounts configured')
           "

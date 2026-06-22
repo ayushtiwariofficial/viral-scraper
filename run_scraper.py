@@ -41,6 +41,7 @@ from scrapers.reddit_scraper   import scrape_reddit
 from scrapers.rss_scraper      import scrape_rss
 from scrapers.linkedin_scraper import scrape_linkedin
 from ai.scorer import score_posts, build_queue
+from ai.rewriter import rewrite_posts
 
 
 # ── Runner ────────────────────────────────────────────────────
@@ -107,8 +108,22 @@ def run_scoring() -> None:
     logger.info("")
 
 
+def run_rewriting() -> None:
+    """Run Phase 3: AI content rewriting for Twitter + LinkedIn."""
+    logger.info("=" * 60)
+    logger.info("AI content rewriting started")
+    logger.info("=" * 60)
+
+    rewrite_result = rewrite_posts()
+    logger.info(
+        f"Rewriting: {rewrite_result.get('rewritten', 0)} rewritten, "
+        f"{rewrite_result.get('failed', 0)} failed"
+    )
+    logger.info("")
+
+
 def show_stats() -> None:
-    from data.database import get_scoring_stats
+    from data.database import get_scoring_stats, get_rewrite_stats
 
     stats = get_stats()
     print("\n── Database stats ───────────────────────────")
@@ -125,6 +140,14 @@ def show_stats() -> None:
     print(f"  Skipped (low score) : {scoring['skipped']}")
     print(f"  Average total score : {scoring['avg_score']}")
 
+    rewrites = get_rewrite_stats()
+    print("\n── AI rewriting breakdown ────────────────────")
+    print(f"  Awaiting rewrite    : {rewrites['queued_awaiting_rewrite']}")
+    print(f"  Rewritten           : {rewrites['rewritten']}")
+    print(f"  Gave up (failed)    : {rewrites['rewrite_failed']}")
+    print(f"  In content queue    : {rewrites['total_in_content_queue']}")
+    print(f"  Ready to post       : {rewrites['ready_to_post']}")
+
     print("\n── Last 5 scraper runs ──────────────────────")
     for run in stats["recent_runs"]:
         status = f"❌ {run['error'][:50]}" if run.get("error") else "✓"
@@ -137,16 +160,23 @@ def show_stats() -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Viral content scraper")
-    parser.add_argument("--source",       help="Run a single scraper source (twitter/reddit/rss/linkedin)")
-    parser.add_argument("--stats",        action="store_true", help="Show DB stats and exit")
-    parser.add_argument("--score-only",   action="store_true", help="Run AI scoring only, skip scraping")
-    parser.add_argument("--skip-scoring", action="store_true", help="Run scrapers only, skip AI scoring step")
+    parser.add_argument("--source",        help="Run a single scraper source (twitter/reddit/rss/linkedin)")
+    parser.add_argument("--stats",         action="store_true", help="Show DB stats and exit")
+    parser.add_argument("--score-only",    action="store_true", help="Run AI scoring only, skip scraping")
+    parser.add_argument("--rewrite-only",  action="store_true", help="Run AI rewriting only, skip scraping + scoring")
+    parser.add_argument("--skip-scoring",  action="store_true", help="Run scrapers only, skip AI scoring step")
+    parser.add_argument("--skip-rewrite",  action="store_true", help="Skip AI rewriting step")
     args = parser.parse_args()
 
     # Always init DB first
     init_db()
 
     if args.stats:
+        show_stats()
+        return
+
+    if args.rewrite_only:
+        run_rewriting()
         show_stats()
         return
 
@@ -158,10 +188,13 @@ def main():
     sources = [args.source] if args.source else None
     run_all(sources)
 
-    # Chain AI scoring right after scraping (unless explicitly skipped
-    # or only one source was requested via --source)
+    # Chain AI scoring + rewriting right after scraping (unless explicitly
+    # skipped or only one source was requested via --source)
     if not args.skip_scoring and not args.source:
         run_scoring()
+
+    if not args.skip_rewrite and not args.source:
+        run_rewriting()
 
     show_stats()
 
