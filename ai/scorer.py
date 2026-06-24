@@ -1,9 +1,21 @@
 # ============================================================
 #  ai/scorer.py  —  Phase 2: AI virality scoring via Groq
 #
-#  Groq free tier: 14,400 requests/day, no credit card.
-#  Model: openai/gpt-oss-20b — fast and free, perfect for
-#  scoring short social posts.
+#  Model: qwen/qwen3.6-27b with reasoning_effort="none" and
+#  strict json_schema structured outputs.
+#
+#  Why this combo (and not openai/gpt-oss-20b):
+#  - gpt-oss-20b is a reasoning model that burns hidden "thinking"
+#    tokens even for simple tasks, which blew through its 200K
+#    tokens-per-day (TPD) budget in a single day of normal use.
+#  - gpt-oss-20b's json_object mode also produced "json_validate_failed"
+#    400 errors on a meaningful fraction of calls — a known issue
+#    reported by multiple developers on Groq's community forum.
+#  - qwen3.6-27b supports reasoning_effort="none" (skips reasoning
+#    tokens entirely for simple tasks like this) AND supports
+#    strict:true json_schema mode, which Groq's own docs describe
+#    as "never errors or produces invalid JSON" because the model
+#    is constrained at the token level, not just prompted to comply.
 #
 #  Sign up at: https://console.groq.com
 # ============================================================
@@ -30,7 +42,22 @@ logger = logging.getLogger(__name__)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL   = "openai/gpt-oss-20b"   # fast + free; replaces deprecated llama-3.1-8b-instant (deprecated Jun 2026)
+GROQ_MODEL   = "qwen/qwen3.6-27b"   # non-reasoning mode avoids gpt-oss-20b's TPD/JSON issues
+
+# Strict JSON schema — Groq guarantees the output always matches this
+# exactly when strict=True, eliminating the json_validate_failed errors
+# we saw with the older json_object mode.
+SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "virality":   {"type": "number"},
+        "relevance":  {"type": "number"},
+        "uniqueness": {"type": "number"},
+        "reason":     {"type": "string"},
+    },
+    "required": ["virality", "relevance", "uniqueness", "reason"],
+    "additionalProperties": False,
+}
 
 
 # ── Prompt ────────────────────────────────────────────────────
@@ -49,18 +76,22 @@ Post to score:
 ---
 {content}
 ---
-
-Respond with ONLY a JSON object, no other text, no markdown formatting:
-{{"virality": <number>, "relevance": <number>, "uniqueness": <number>, "reason": "<one short sentence>"}}
 """
 
 
 # ── Groq API call ─────────────────────────────────────────────
 
+class QuotaExhausted(Exception):
+    """Raised when Groq's daily token budget (TPD) is used up for the day."""
+    pass
+
+
 def call_groq(prompt: str, max_retries: int = 3) -> dict | None:
     """
     Call the Groq API with a scoring prompt.
     Returns parsed JSON dict, or None if it fails after retries.
+    Raises QuotaExhausted if the daily token budget is used up —
+    that's a multi-hour wait, not something worth retrying in a CI run.
     """
     import httpx
 
@@ -71,13 +102,19 @@ def call_groq(prompt: str, max_retries: int = 3) -> dict | None:
     payload = {
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,     # low temperature = more consistent scoring
-        "max_tokens": 600,      # gpt-oss-20b is a reasoning model — needs headroom
-                                 # for internal reasoning tokens + the JSON answer,
-                                 # or it gets truncated mid-JSON and Groq returns 400
-        "reasoning_effort": "low",   # minimize reasoning tokens — we just need a score,
-                                      # not deep analysis. Saves tokens + speeds up calls.
-        "response_format": {"type": "json_object"},   # forces valid JSON back
+        "temperature": 0.3,            # low temperature = more consistent scoring
+        "max_tokens": 150,             # plenty — no hidden reasoning tokens to budget for
+        "reasoning_effort": "none",    # qwen3.6-27b: skip reasoning entirely for this
+                                        # simple scoring task — saves tokens + avoids the
+                                        # TPD exhaustion we hit with a reasoning model
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "post_score",
+                "strict": True,         # constrained decoding — output always matches
+                "schema": SCORE_SCHEMA, # the schema below, so json_validate_failed can't happen
+            },
+        },
     }
 
     for attempt in range(1, max_retries + 1):
@@ -87,32 +124,38 @@ def call_groq(prompt: str, max_retries: int = 3) -> dict | None:
                 resp = client.post(GROQ_API_URL, headers=headers, json=payload)
 
             if resp.status_code == 429:
-                wait = 5 * attempt
-                logger.warning(f"Groq rate limited — waiting {wait}s (attempt {attempt})")
-                time.sleep(wait)
-                continue
+                try:
+                    err = resp.json().get("error", {})
+                    err_msg = err.get("message", "")
+                except Exception:
+                    err_msg = ""
 
-            if resp.status_code == 400:
-                # The model failed to produce valid JSON matching the constraint.
-                # Retrying with the same prompt sometimes succeeds since this is
-                # a generation issue, not a request format issue.
-                body_preview = resp.text[:200]
-                logger.warning(f"Groq 400 (bad generation) attempt {attempt}: {body_preview}")
-                time.sleep(1)
+                # TPD (tokens-per-day) exhaustion means "wait hours", not seconds —
+                # retrying in this run is pointless and would just eat the whole
+                # GitHub Actions timeout. Raise immediately so the caller can stop
+                # the whole batch instead of retrying post after post.
+                if "tokens per day" in err_msg.lower() or "tpd" in err_msg.lower():
+                    raise QuotaExhausted(err_msg)
+
+                wait = 5 * attempt
+                match = re.search(r"try again in ([\d.]+)s", err_msg)
+                if match:
+                    wait = min(float(match.group(1)) + 1, 60)   # cap at 60s — don't hang CI
+                logger.warning(f"Groq rate limited — waiting {wait:.0f}s (attempt {attempt})")
+                time.sleep(wait)
                 continue
 
             resp.raise_for_status()
             data = resp.json()
             text = data["choices"][0]["message"]["content"]
 
-            # Defensive: strip markdown code fences if the model adds them
-            # despite being told not to (happens occasionally with some models)
-            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
-            return json.loads(cleaned)
+            return json.loads(text)
 
         except json.JSONDecodeError:
             preview = text[:100] if text else "(no response body)"
             logger.warning(f"Groq returned invalid JSON (attempt {attempt}): {preview}")
+        except QuotaExhausted:
+            raise   # let this propagate — don't swallow it in the generic except below
         except Exception as e:
             logger.warning(f"Groq call failed (attempt {attempt}): {e}")
             time.sleep(2)
@@ -159,7 +202,17 @@ def score_posts() -> dict:
         content_for_prompt = content[:1200]
         prompt = SCORING_PROMPT.format(niche=NICHE_DESCRIPTION, content=content_for_prompt)
 
-        result = call_groq(prompt)
+        try:
+            result = call_groq(prompt)
+        except QuotaExhausted as e:
+            # Daily token budget is gone — there's no point trying the
+            # remaining posts in this batch, they'll all fail the same way.
+            # Stop here and let the next scheduled run (after the quota
+            # resets at midnight Pacific) pick up where we left off.
+            msg = f"Groq daily token quota exhausted — stopping batch early: {e}"
+            logger.warning(msg)
+            errors.append(msg)
+            break
 
         if result is None:
             mark_skipped(post["id"], reason="Groq scoring failed after retries")

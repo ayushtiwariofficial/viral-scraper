@@ -90,6 +90,7 @@ jobs:
 
       # 7. Run the scraper
       - name: Run scraper
+        timeout-minutes: 10   # leaves headroom in the 15-min job budget for cleanup steps
         env:
           GROQ_API_KEY:   ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

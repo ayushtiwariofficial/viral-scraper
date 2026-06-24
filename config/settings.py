@@ -83,7 +83,11 @@ MAX_RETRIES      = 3
 RUN_EVERY_HOURS  = 2
 
 # ── Phase 2: AI Scoring settings ─────────────────────────────
-GROQ_MODEL          = "openai/gpt-oss-20b"   # free, fast (llama-3.3-70b-versatile was deprecated Jun 2026)
+GROQ_MODEL          = "qwen/qwen3.6-27b"   # NOTE: ai/scorer.py defines its own GROQ_MODEL constant and
+                                             # does not read this value — kept here for reference only.
+                                             # Switched from openai/gpt-oss-20b (reasoning model) because
+                                             # it exhausted its 200K tokens-per-day budget in a single day
+                                             # and had unreliable JSON output (json_validate_failed errors).
 SCORING_BATCH_SIZE  = 50      # max posts to score per run (50/run x 12 runs/day = 600/day capacity)
 SCORING_MIN_TOTAL   = 5.0     # posts below this total score get marked 'skipped'
 
