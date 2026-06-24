@@ -84,7 +84,7 @@ RUN_EVERY_HOURS  = 2
 
 # ── Phase 2: AI Scoring settings ─────────────────────────────
 GROQ_MODEL          = "openai/gpt-oss-20b"   # free, fast (llama-3.3-70b-versatile was deprecated Jun 2026)
-SCORING_BATCH_SIZE  = 30      # max posts to score per run (stay within free limits)
+SCORING_BATCH_SIZE  = 50      # max posts to score per run (50/run x 12 runs/day = 600/day capacity)
 SCORING_MIN_TOTAL   = 5.0     # posts below this total score get marked 'skipped'
 
 # Your niche description — used in the scoring prompt so the AI

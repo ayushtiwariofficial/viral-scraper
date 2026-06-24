@@ -15,7 +15,7 @@ import re
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.settings import TOP_POSTS_PER_RUN, REQUEST_DELAY, NICHE_DESCRIPTION
+from config.settings import TOP_POSTS_PER_RUN, REQUEST_DELAY, NICHE_DESCRIPTION, SCORING_BATCH_SIZE
 from data.database import (
     get_unscored_posts, save_score, mark_skipped,
     get_top_scored_posts, mark_queued, log_run,
@@ -31,8 +31,6 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL   = "openai/gpt-oss-20b"   # fast + free; replaces deprecated llama-3.1-8b-instant (deprecated Jun 2026)
-
-MAX_POSTS_PER_RUN = 30   # cap how many posts we score per run (stay within free limits)
 
 
 # ── Prompt ────────────────────────────────────────────────────
@@ -74,20 +72,33 @@ def call_groq(prompt: str, max_retries: int = 3) -> dict | None:
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,     # low temperature = more consistent scoring
-        "max_tokens": 150,
+        "max_tokens": 600,      # gpt-oss-20b is a reasoning model — needs headroom
+                                 # for internal reasoning tokens + the JSON answer,
+                                 # or it gets truncated mid-JSON and Groq returns 400
+        "reasoning_effort": "low",   # minimize reasoning tokens — we just need a score,
+                                      # not deep analysis. Saves tokens + speeds up calls.
         "response_format": {"type": "json_object"},   # forces valid JSON back
     }
 
     for attempt in range(1, max_retries + 1):
         text = None
         try:
-            with httpx.Client(timeout=15) as client:
+            with httpx.Client(timeout=20) as client:
                 resp = client.post(GROQ_API_URL, headers=headers, json=payload)
 
             if resp.status_code == 429:
                 wait = 5 * attempt
                 logger.warning(f"Groq rate limited — waiting {wait}s (attempt {attempt})")
                 time.sleep(wait)
+                continue
+
+            if resp.status_code == 400:
+                # The model failed to produce valid JSON matching the constraint.
+                # Retrying with the same prompt sometimes succeeds since this is
+                # a generation issue, not a request format issue.
+                body_preview = resp.text[:200]
+                logger.warning(f"Groq 400 (bad generation) attempt {attempt}: {body_preview}")
+                time.sleep(1)
                 continue
 
             resp.raise_for_status()
@@ -134,7 +145,7 @@ def score_posts() -> dict:
                 started_at=started_at, error=msg)
         return {"source": "ai_scoring", "scored": 0, "skipped": 0, "errors": [msg]}
 
-    posts = get_unscored_posts(limit=MAX_POSTS_PER_RUN)
+    posts = get_unscored_posts(limit=SCORING_BATCH_SIZE)
     logger.info(f"Found {len(posts)} unscored posts to process")
 
     scored_count  = 0
