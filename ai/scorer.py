@@ -1,21 +1,28 @@
 # ============================================================
 #  ai/scorer.py  —  Phase 2: AI virality scoring via Groq
 #
-#  Model: qwen/qwen3.6-27b with reasoning_effort="none" and
+#  Model: openai/gpt-oss-20b with reasoning_effort="low" and
 #  strict json_schema structured outputs.
 #
-#  Why this combo (and not openai/gpt-oss-20b):
-#  - gpt-oss-20b is a reasoning model that burns hidden "thinking"
-#    tokens even for simple tasks, which blew through its 200K
-#    tokens-per-day (TPD) budget in a single day of normal use.
-#  - gpt-oss-20b's json_object mode also produced "json_validate_failed"
-#    400 errors on a meaningful fraction of calls — a known issue
-#    reported by multiple developers on Groq's community forum.
-#  - qwen3.6-27b supports reasoning_effort="none" (skips reasoning
-#    tokens entirely for simple tasks like this) AND supports
-#    strict:true json_schema mode, which Groq's own docs describe
-#    as "never errors or produces invalid JSON" because the model
+#  Model history (so future-me doesn't repeat these mistakes):
+#  - Tried gpt-oss-20b + json_object mode: ~35% of calls failed
+#    with "json_validate_failed" 400s (known Groq community issue),
+#    and the model's hidden reasoning tokens (at max_tokens=600)
+#    blew through its 200K tokens-per-day (TPD) budget in <24h.
+#  - Tried qwen/qwen3.6-27b + json_schema strict mode: 100% of
+#    calls failed instantly with "This model does not support
+#    response format json_schema" — per Groq's docs, strict:true
+#    is ONLY supported on openai/gpt-oss-20b and openai/gpt-oss-120b,
+#    nothing else, as of this writing.
+#  - Current approach: gpt-oss-20b (the only free-tier model that
+#    actually supports strict mode) + reasoning_effort="low" (the
+#    minimum gpt-oss-20b allows, to limit — not eliminate — hidden
+#    reasoning tokens) + strict:true json_schema, which Groq's docs
+#    state "never errors or produces invalid JSON" since the model
 #    is constrained at the token level, not just prompted to comply.
+#    This should fix the json_validate_failed issue. The TPD budget
+#    is watched via the QuotaExhausted circuit breaker below, since
+#    reasoning tokens still count against it even at "low" effort.
 #
 #  Sign up at: https://console.groq.com
 # ============================================================
@@ -42,11 +49,10 @@ logger = logging.getLogger(__name__)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL   = "qwen/qwen3.6-27b"   # non-reasoning mode avoids gpt-oss-20b's TPD/JSON issues
+GROQ_MODEL   = "openai/gpt-oss-20b"   # the only free-tier model that supports strict:true json_schema
 
-# Strict JSON schema — Groq guarantees the output always matches this
-# exactly when strict=True, eliminating the json_validate_failed errors
-# we saw with the older json_object mode.
+# Strict JSON schema — per Groq's docs this guarantees the output always
+# matches exactly via constrained decoding, eliminating json_validate_failed.
 SCORE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -103,10 +109,13 @@ def call_groq(prompt: str, max_retries: int = 3) -> dict | None:
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,            # low temperature = more consistent scoring
-        "max_tokens": 150,             # plenty — no hidden reasoning tokens to budget for
-        "reasoning_effort": "none",    # qwen3.6-27b: skip reasoning entirely for this
-                                        # simple scoring task — saves tokens + avoids the
-                                        # TPD exhaustion we hit with a reasoning model
+        "max_tokens": 400,             # room for low-effort reasoning + the JSON answer
+        "reasoning_effort": "low",     # IMPORTANT: gpt-oss-20b only accepts low/medium/high —
+                                        # "none" is a qwen3-only value and gpt-oss-20b rejects
+                                        # it with an instant 400 (this was the actual bug —
+                                        # confirmed against Groq's own API reference docs).
+                                        # "low" still uses some reasoning tokens, but it's
+                                        # the minimum gpt-oss-20b supports.
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -145,7 +154,20 @@ def call_groq(prompt: str, max_retries: int = 3) -> dict | None:
                 time.sleep(wait)
                 continue
 
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # Read Groq's actual error body BEFORE raising — raise_for_status()
+                # only gives a generic "400 Bad Request" with no detail, which is
+                # exactly what hid the real cause of this bug for two debugging
+                # rounds. Always log the real message so this can't happen again.
+                try:
+                    err_body = resp.json().get("error", {})
+                    err_msg = err_body.get("message", resp.text[:300])
+                except Exception:
+                    err_msg = resp.text[:300]
+                logger.warning(f"Groq {resp.status_code} (attempt {attempt}): {err_msg}")
+                time.sleep(1)
+                continue
+
             data = resp.json()
             text = data["choices"][0]["message"]["content"]
 
