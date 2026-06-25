@@ -89,13 +89,21 @@ def call_gemini(prompt: str, max_retries: int = MAX_RETRIES) -> dict | None:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.8,        # higher than scoring — we want creative variety
-            "maxOutputTokens": 800,
+            "maxOutputTokens": 2048,   # was 800 — too low. A Twitter thread + LinkedIn
+                                        # post + hashtags routinely needs 900-1400 tokens
+                                        # once you include JSON structure overhead (quotes,
+                                        # escaped newlines, brackets). At 800 the response
+                                        # was getting cut off mid-string every time, which
+                                        # is exactly why every single rewrite failed with
+                                        # "invalid JSON" — it wasn't malformed, it was
+                                        # truncated. 2048 gives real headroom.
             "responseMimeType": "application/json",   # forces valid JSON back
         },
     }
 
     for attempt in range(1, max_retries + 1):
         text = None
+        finish_reason = None
         try:
             with httpx.Client(timeout=30) as client:
                 resp = client.post(GEMINI_API_URL, headers=headers, params=params, json=payload)
@@ -106,8 +114,24 @@ def call_gemini(prompt: str, max_retries: int = MAX_RETRIES) -> dict | None:
                 time.sleep(wait)
                 continue
 
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # Log Gemini's actual error body instead of letting raise_for_status()
+                # hide it behind a generic "400/503 ... " message with no detail.
+                try:
+                    err_body = resp.json().get("error", {})
+                    err_msg = err_body.get("message", resp.text[:300])
+                except Exception:
+                    err_msg = resp.text[:300]
+                logger.warning(f"Gemini {resp.status_code} (attempt {attempt}): {err_msg}")
+                time.sleep(2)
+                continue
+
             data = resp.json()
+
+            # Check why generation stopped BEFORE trying to parse — if it was
+            # cut off due to the token limit, json.loads will fail anyway, but
+            # this tells us *why* immediately instead of just "invalid JSON".
+            finish_reason = data.get("candidates", [{}])[0].get("finishReason")
 
             # Gemini's response shape: candidates[0].content.parts[0].text
             text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -118,7 +142,16 @@ def call_gemini(prompt: str, max_retries: int = MAX_RETRIES) -> dict | None:
 
         except json.JSONDecodeError:
             preview = text[:150] if text else "(no response body)"
-            logger.warning(f"Gemini returned invalid JSON (attempt {attempt}): {preview}")
+            if finish_reason == "MAX_TOKENS":
+                logger.warning(
+                    f"Gemini response truncated by maxOutputTokens (attempt {attempt}) — "
+                    f"increase maxOutputTokens further if this keeps happening. Preview: {preview}"
+                )
+            else:
+                logger.warning(
+                    f"Gemini returned invalid JSON (attempt {attempt}, "
+                    f"finish_reason={finish_reason}): {preview}"
+                )
         except (KeyError, IndexError) as e:
             # Usually means content was blocked by safety filters, or empty response
             preview = str(data)[:200] if 'data' in dir() else "(no data)"
