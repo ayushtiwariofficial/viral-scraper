@@ -55,15 +55,15 @@ ORIGINAL CONTENT (for inspiration only — do not copy verbatim, extract the cor
 {content}
 ---
 
-Create TWO versions:
+Create TWO versions. Be CONCISE — brevity matters more than completeness here.
 
-1. TWITTER THREAD: A hook tweet (under 200 chars, must grab attention in first line) followed by 2-4 short follow-up tweets that build on the idea. Each tweet under 270 chars.
+1. TWITTER THREAD: A hook tweet (under 200 chars, must grab attention in first line) followed by 2-3 short follow-up tweets that build on the idea. HARD LIMIT: every tweet must be under 260 characters, no exceptions — count carefully before finalizing.
 
-2. LINKEDIN POST: 150-250 words, more narrative and reflective tone, can include a personal angle ("I've been thinking about this..." or "This made me reconsider..."), ends with a question or call to engage.
+2. LINKEDIN POST: 120-200 words (shorter is fine), more narrative and reflective tone, can include a personal angle ("I've been thinking about this..." or "This made me reconsider..."), ends with a question or call to engage.
 
 3. HASHTAGS: 3-5 relevant hashtags that fit both platforms.
 
-IMPORTANT: This is a fresh rewrite in a new voice, not a copy. Extract the underlying idea/insight and re-express it naturally. Do not reuse distinctive phrases from the original.
+IMPORTANT: This is a fresh rewrite in a new voice, not a copy. Extract the underlying idea/insight and re-express it naturally. Do not reuse distinctive phrases from the original. Keep the total response compact — do not pad with extra commentary or alternate versions.
 
 Respond with ONLY a JSON object, no other text, no markdown formatting:
 {{
@@ -89,14 +89,13 @@ def call_gemini(prompt: str, max_retries: int = MAX_RETRIES) -> dict | None:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.8,        # higher than scoring — we want creative variety
-            "maxOutputTokens": 2048,   # was 800 — too low. A Twitter thread + LinkedIn
-                                        # post + hashtags routinely needs 900-1400 tokens
-                                        # once you include JSON structure overhead (quotes,
-                                        # escaped newlines, brackets). At 800 the response
-                                        # was getting cut off mid-string every time, which
-                                        # is exactly why every single rewrite failed with
-                                        # "invalid JSON" — it wasn't malformed, it was
-                                        # truncated. 2048 gives real headroom.
+            "maxOutputTokens": 3072,   # was 2048 — still not enough for longer/denser
+                                        # source articles. Post 288 (a detailed piece on
+                                        # AI video production costs) kept truncating even
+                                        # at 2048 across 3 retries. 3072 gives more
+                                        # consistent headroom; see also the input-length
+                                        # cap below, which reduces how much the model
+                                        # tends to write in response.
             "responseMimeType": "application/json",   # forces valid JSON back
         },
     }
@@ -166,8 +165,9 @@ def call_gemini(prompt: str, max_retries: int = MAX_RETRIES) -> dict | None:
 def validate_rewrite(result: dict) -> bool:
     """
     Sanity-check the AI's output before saving it.
-    Returns False if the structure is malformed — better to skip
-    a bad rewrite than post broken content to your real accounts.
+    Returns False only if the structure is fundamentally broken —
+    missing fields, wrong types. Returns True for fixable issues
+    (oversized tweets), since sanitize_rewrite() handles those.
     """
     if not isinstance(result, dict):
         return False
@@ -178,14 +178,43 @@ def validate_rewrite(result: dict) -> bool:
 
     if not isinstance(thread, list) or len(thread) < 1:
         return False
-    if not all(isinstance(t, str) and len(t) <= 280 for t in thread):
-        return False   # a tweet over 280 chars would fail to post later
+    if not all(isinstance(t, str) and len(t.strip()) > 0 for t in thread):
+        return False   # empty or non-string tweets can't be salvaged
     if not isinstance(post, str) or len(post) < 50:
         return False
     if not isinstance(tags, list):
         return False
 
     return True
+
+
+def sanitize_rewrite(result: dict) -> dict:
+    """
+    Fix up minor, recoverable issues in an otherwise-valid rewrite
+    rather than discarding the whole thing:
+      - Tweets over 280 chars get trimmed to fit, breaking at the
+        last whole word and adding an ellipsis, instead of failing
+        the entire post over one oversized line. Gemini's "under
+        260 chars" instruction in the prompt is a strong nudge, not
+        a hard guarantee, so this is the actual enforcement point.
+    """
+    MAX_TWEET_LEN = 280
+
+    fixed_thread = []
+    for tweet in result["twitter_thread"]:
+        tweet = tweet.strip()
+        if len(tweet) > MAX_TWEET_LEN:
+            # Trim to fit, breaking at the last full word before the limit
+            truncated = tweet[:MAX_TWEET_LEN - 1]
+            last_space = truncated.rfind(" ")
+            if last_space > MAX_TWEET_LEN * 0.6:   # don't cut too aggressively
+                truncated = truncated[:last_space]
+            tweet = truncated.rstrip(",.;: ") + "…"
+            logger.info(f"  Trimmed oversized tweet ({len(result['twitter_thread'])} chars -> {len(tweet)})")
+        fixed_thread.append(tweet)
+
+    result["twitter_thread"] = fixed_thread
+    return result
 
 
 # ── Main rewriting function ──────────────────────────────────
@@ -230,6 +259,8 @@ def rewrite_posts() -> dict:
             errors.append(f"Post {post['id']} from {post['source']}: malformed AI response")
             logger.error(f"  ✗ Post {post['id']}: AI response failed validation — {str(result)[:150]}")
             continue
+
+        result = sanitize_rewrite(result)   # trim any oversized tweets rather than discarding
 
         save_rewritten_content(
             raw_post_id    = post["id"],
