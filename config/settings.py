@@ -18,11 +18,20 @@ TOP_POSTS_PER_RUN = 5
 MIN_ENGAGEMENT = 10
 
 # ── Nitter instances (public mirrors of Twitter, free) ───────
-#    If one goes down, the next is tried automatically
+#    If one goes down, the next is tried automatically.
+#    IMPORTANT: Nitter as a platform has become structurally unreliable
+#    in 2026 — X/Twitter removed the guest-account API Nitter relied on,
+#    so public instances now depend on rotating real-account credentials
+#    that frequently get banned. This list reflects instances confirmed
+#    working via https://nitter.net/ (status: https://status.d420.de/)
+#    as of June 2026, in rough order of reliability. Even so, expect
+#    this list to need periodic updates — check the status page above
+#    if Twitter scraping starts failing consistently again.
 NITTER_INSTANCES = [
-    "https://nitter.net",
-    "https://nitter.privacydev.net",
     "https://nitter.poast.org",
+    "https://xcancel.com",
+    "https://nitter.privacyredirect.com",
+    "https://nitter.tiekoetter.com",
 ]
 
 # ── Twitter accounts to scrape via Nitter ───────────────────
@@ -97,6 +106,15 @@ LOG_PATH = os.path.join(BASE_DIR, "logs", "scraper.log")
 REQUEST_TIMEOUT  = 10    # seconds
 REQUEST_DELAY    = 2     # seconds between requests (be polite)
 MAX_RETRIES      = 3
+
+# Hard ceiling on total wall-clock time the Twitter scraper is allowed
+# to spend across ALL accounts/instances combined. This is a circuit
+# breaker — if Nitter instances are degraded (slow but not outright
+# erroring), per-request timeouts alone don't help, because 10 accounts
+# x 4 instances x 10s timeout = 400s worst case, which still eats most
+# of a CI job's budget. This caps the whole scraper at a sane ceiling
+# regardless, so one bad Nitter day can't time out the whole workflow.
+TWITTER_SCRAPE_TIME_BUDGET = 180   # seconds (3 minutes)
 
 # ── Scraper run interval (used in crontab comment only) ──────
 RUN_EVERY_HOURS  = 2
