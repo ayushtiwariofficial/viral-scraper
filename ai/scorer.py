@@ -255,7 +255,13 @@ def score_posts() -> dict:
             f"V:{virality} R:{relevance} U:{uniqueness} — {reason[:60]}"
         )
 
-        time.sleep(0.5)   # gentle pacing — well within Groq free limits
+        time.sleep(2.1)   # 30 RPM free-tier limit = 1 req every 2s minimum.
+                            # Was 0.5s (theoretical 120/min) which is 4x over
+                            # the real limit — we were relying entirely on
+                            # catching 429s and retrying, which works but
+                            # wastes ~30% of calls on retries instead of
+                            # progress. 2.1s gives a small safety margin
+                            # above the exact 2.0s/request boundary.
 
     summary = {
         "source":  "ai_scoring",
