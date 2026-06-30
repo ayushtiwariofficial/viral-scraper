@@ -42,6 +42,7 @@ from scrapers.rss_scraper      import scrape_rss
 from scrapers.linkedin_scraper import scrape_linkedin
 from ai.scorer import score_posts, build_queue
 from ai.rewriter import rewrite_posts
+from poster.notifier import notify_ready_content
 
 
 # ── Runner ────────────────────────────────────────────────────
@@ -122,6 +123,22 @@ def run_rewriting() -> None:
     logger.info("")
 
 
+def run_notifications() -> None:
+    """
+    Run Phase 4 (notification half): tell the user about freshly
+    rewritten content. Twitter drafts are copy-paste ready; LinkedIn
+    posts need explicit approval (see poster/linkedin_poster.py).
+    This never posts anything itself — it only notifies.
+    """
+    logger.info("=" * 60)
+    logger.info("Notifying about ready content")
+    logger.info("=" * 60)
+
+    result = notify_ready_content()
+    logger.info(f"Notifications: {result.get('notified', 0)} sent")
+    logger.info("")
+
+
 def show_stats() -> None:
     from data.database import get_scoring_stats, get_rewrite_stats
 
@@ -148,6 +165,26 @@ def show_stats() -> None:
     print(f"  In content queue    : {rewrites['total_in_content_queue']}")
     print(f"  Ready to post       : {rewrites['ready_to_post']}")
 
+    from data.database import get_db
+    with get_db() as conn:
+        pending_approval = conn.execute(
+            "SELECT COUNT(*) FROM content_queue WHERE approval_status='pending' AND posted_linkedin=0"
+        ).fetchone()[0]
+        posted_li = conn.execute(
+            "SELECT COUNT(*) FROM content_queue WHERE posted_linkedin=1"
+        ).fetchone()[0]
+        posted_tw = conn.execute(
+            "SELECT COUNT(*) FROM content_queue WHERE posted_twitter=1"
+        ).fetchone()[0]
+        rejected = conn.execute(
+            "SELECT COUNT(*) FROM content_queue WHERE approval_status='rejected'"
+        ).fetchone()[0]
+    print("\n── Posting status (Phase 4) ──────────────────")
+    print(f"  LinkedIn pending approval : {pending_approval}")
+    print(f"  LinkedIn posted           : {posted_li}")
+    print(f"  LinkedIn rejected         : {rejected}")
+    print(f"  Twitter posted (manual)   : {posted_tw}")
+
     print("\n── Last 5 scraper runs ──────────────────────")
     for run in stats["recent_runs"]:
         status = f"❌ {run['error'][:50]}" if run.get("error") else "✓"
@@ -166,17 +203,36 @@ def main():
     parser.add_argument("--rewrite-only",  action="store_true", help="Run AI rewriting only, skip scraping + scoring")
     parser.add_argument("--skip-scoring",  action="store_true", help="Run scrapers only, skip AI scoring step")
     parser.add_argument("--skip-rewrite",  action="store_true", help="Skip AI rewriting step")
+    parser.add_argument("--skip-notify",   action="store_true", help="Skip sending notifications about ready content")
+    parser.add_argument("--notify-only",   action="store_true", help="Run notifications only, skip everything else")
+    parser.add_argument(
+        "--mark-twitter-posted", type=int, metavar="ID",
+        help="Mark a content_queue ID as manually posted to Twitter (Twitter posting is manual — see settings.py)"
+    )
     args = parser.parse_args()
 
     # Always init DB first
     init_db()
 
+    if args.mark_twitter_posted:
+        from data.database import mark_posted_twitter
+        mark_posted_twitter(args.mark_twitter_posted)
+        print(f"✓ Marked content #{args.mark_twitter_posted} as posted to Twitter")
+        return
+
     if args.stats:
+        show_stats()
+        return
+
+    if args.notify_only:
+        run_notifications()
         show_stats()
         return
 
     if args.rewrite_only:
         run_rewriting()
+        if not args.skip_notify:
+            run_notifications()
         show_stats()
         return
 
@@ -188,13 +244,16 @@ def main():
     sources = [args.source] if args.source else None
     run_all(sources)
 
-    # Chain AI scoring + rewriting right after scraping (unless explicitly
-    # skipped or only one source was requested via --source)
+    # Chain AI scoring + rewriting + notifications right after scraping
+    # (unless explicitly skipped or only one source was requested via --source)
     if not args.skip_scoring and not args.source:
         run_scoring()
 
     if not args.skip_rewrite and not args.source:
         run_rewriting()
+
+    if not args.skip_notify and not args.source:
+        run_notifications()
 
     show_stats()
 

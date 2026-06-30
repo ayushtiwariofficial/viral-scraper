@@ -56,7 +56,10 @@ CREATE TABLE IF NOT EXISTS content_queue (
     scheduled_at    TEXT,                    -- when to post
     posted_twitter  INTEGER DEFAULT 0,       -- 0 = no, 1 = yes
     posted_linkedin INTEGER DEFAULT 0,
-    posted_at       TEXT
+    posted_at       TEXT,
+    posted_linkedin_url TEXT,                -- profile/post URL after successful LinkedIn post
+    approval_status TEXT    DEFAULT 'pending', -- 'pending' | 'approved' | 'rejected'
+    notified        INTEGER DEFAULT 0         -- 0 = no notification sent yet, 1 = sent
 );
 
 -- Scraper run history
@@ -105,14 +108,21 @@ def init_db():
     with get_db() as conn:
         conn.executescript(SCHEMA)
 
-        # Migration: add rewrite_attempts column if an older DB doesn't have it.
-        # (Safe to run every time — SQLite raises if the column already exists,
-        # so we just ignore that specific error.)
-        try:
-            conn.execute("ALTER TABLE raw_posts ADD COLUMN rewrite_attempts INTEGER DEFAULT 0")
-        except sqlite3.OperationalError as e:
-            if "duplicate column" not in str(e).lower():
-                raise
+        # Migrations for columns added after the initial schema — safe to run
+        # every time, since SQLite raises "duplicate column" if it already
+        # exists and we just ignore that specific error.
+        migrations = [
+            "ALTER TABLE raw_posts ADD COLUMN rewrite_attempts INTEGER DEFAULT 0",
+            "ALTER TABLE content_queue ADD COLUMN posted_linkedin_url TEXT",
+            "ALTER TABLE content_queue ADD COLUMN approval_status TEXT DEFAULT 'pending'",
+            "ALTER TABLE content_queue ADD COLUMN notified INTEGER DEFAULT 0",
+        ]
+        for stmt in migrations:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
 
     logger.info(f"Database ready at {DB_PATH}")
 
@@ -432,3 +442,87 @@ def get_rewrite_stats() -> dict:
         "total_in_content_queue": total_in_queue,
         "ready_to_post": ready_to_post,
     }
+
+
+# ── Phase 4: notification + LinkedIn approval/posting helpers ────
+
+def get_unnotified_content(limit: int = 10):
+    """
+    Fetch content_queue rows that haven't been notified about yet —
+    these are fresh rewrites the user hasn't seen a draft/approval
+    request for. Joins raw_posts for source/author context, same
+    pattern as get_unposted_content().
+    """
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT cq.*, r.source AS original_source, r.author AS original_author, r.url AS original_url
+            FROM content_queue cq
+            JOIN raw_posts r ON r.id = cq.raw_post_id
+            WHERE cq.notified = 0
+            ORDER BY cq.created_at
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+
+def mark_notified(content_id: int) -> None:
+    """Mark a content_queue row as having been notified about."""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE content_queue SET notified = 1 WHERE id = ?",
+            (content_id,)
+        )
+
+
+def get_content_by_id(content_id: int):
+    """Fetch a single content_queue row by ID, with source context joined in."""
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT cq.*, r.source AS original_source, r.author AS original_author, r.url AS original_url
+            FROM content_queue cq
+            JOIN raw_posts r ON r.id = cq.raw_post_id
+            WHERE cq.id = ?
+            """,
+            (content_id,)
+        ).fetchone()
+
+
+def set_approval_status(content_id: int, status: str) -> None:
+    """Set a content_queue row's approval_status: 'pending' | 'approved' | 'rejected'."""
+    if status not in ("pending", "approved", "rejected"):
+        raise ValueError(f"Invalid approval_status: {status!r}")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE content_queue SET approval_status = ? WHERE id = ?",
+            (status, content_id)
+        )
+
+
+def mark_posted_linkedin(content_id: int, post_url: str = None) -> None:
+    """Mark a content_queue row as successfully posted to LinkedIn."""
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE content_queue
+            SET posted_linkedin = 1, posted_at = ?, posted_linkedin_url = ?
+            WHERE id = ?
+            """,
+            (datetime.utcnow().isoformat(), post_url, content_id)
+        )
+
+
+def mark_posted_twitter(content_id: int) -> None:
+    """
+    Mark a content_queue row as posted to Twitter. Since Twitter is
+    manual (the API isn't free for new developers as of Feb 2026),
+    this is set by the user confirming they posted the draft manually
+    — see run_scraper.py --mark-twitter-posted.
+    """
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE content_queue SET posted_twitter = 1, posted_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), content_id)
+        )

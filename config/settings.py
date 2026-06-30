@@ -149,3 +149,21 @@ YOUR_VOICE = (
     "humor, genuinely curious about the topic rather than salesy. "
     "Uses simple words. Not afraid to share specific numbers or results."
 )
+
+# ── Phase 4: Notification + Posting settings ──────────────────
+# Max notifications sent per run — keeps you from getting spammed if
+# a backlog of unnotified content builds up after downtime.
+MAX_NOTIFICATIONS_PER_RUN = 5
+
+# Where the LinkedIn browser session (cookies) gets saved after the
+# one-time interactive login. This file is in .gitignore — it
+# contains your actual logged-in session and should never be
+# committed. See poster/linkedin_poster.py --login for setup.
+LINKEDIN_SESSION_PATH = os.path.join(BASE_DIR, "data", "linkedin_session.json")
+
+# NOTE on Twitter/X posting: as of February 6, 2026, X discontinued
+# free API access for new developer accounts — posting now costs
+# $0.015/post ($0.20/post if it contains a link) under the pay-per-use
+# model. Since this project commits to staying genuinely free, Twitter
+# posting is manual: the notifier sends you a copy-paste-ready draft,
+# and you post it yourself. See poster/notifier.py.

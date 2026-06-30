@@ -1,0 +1,95 @@
+# ============================================================
+#  .github/workflows/linkedin-approve.yml
+#
+#  Manually-triggered workflow to approve and post a specific
+#  piece of content to LinkedIn. This is the ONLY path that
+#  posts to LinkedIn — there is no scheduled/automatic posting.
+#
+#  Usage:
+#    1. Check your notifications (ntfy) or run
+#       `python run_scraper.py --stats` to find a content ID
+#    2. Go to Actions tab -> "Approve & Post to LinkedIn" -> Run workflow
+#    3. Enter the content ID and action (approve/reject)
+# ============================================================
+
+name: 💼 Approve & Post to LinkedIn
+
+on:
+  workflow_dispatch:
+    inputs:
+      content_id:
+        description: 'Content queue ID to approve/reject (from notification or --stats)'
+        required: true
+        type: string
+      action:
+        description: 'What to do with this content'
+        required: true
+        type: choice
+        options:
+          - approve
+          - reject
+
+jobs:
+  approve-and-post:
+    name: Process LinkedIn approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 5   # posting itself should take well under a minute;
+                          # this is a safety ceiling, not an expected duration
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Restore database cache
+        uses: actions/cache@v4
+        with:
+          path: data/posts.db
+          key: posts-db-${{ github.ref_name }}
+          restore-keys: posts-db-
+
+      - name: Restore LinkedIn session
+        env:
+          LINKEDIN_SESSION_B64: ${{ secrets.LINKEDIN_SESSION_B64 }}
+        run: |
+          mkdir -p data
+          if [ -z "$LINKEDIN_SESSION_B64" ]; then
+            echo "::error::LINKEDIN_SESSION_B64 secret is not set. Run 'python -m poster.linkedin_poster --login' "
+            echo "::error::locally first, then base64-encode data/linkedin_session.json and save it as a secret."
+            exit 1
+          fi
+          echo "$LINKEDIN_SESSION_B64" | base64 -d > data/linkedin_session.json
+
+      - name: Process approval
+        run: |
+          if [ "${{ inputs.action }}" = "approve" ]; then
+            python -m poster.linkedin_poster --approve "${{ inputs.content_id }}"
+          else
+            python -m poster.linkedin_poster --reject "${{ inputs.content_id }}"
+          fi
+
+      - name: Save database to cache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: data/posts.db
+          key: posts-db-${{ github.ref_name }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linkedin-approval-${{ github.run_number }}
+          path: logs/scraper.log
+          if-no-files-found: ignore
+          retention-days: 7
