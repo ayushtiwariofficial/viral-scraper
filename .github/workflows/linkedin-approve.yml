@@ -33,8 +33,10 @@ jobs:
   approve-and-post:
     name: Process LinkedIn approval
     runs-on: ubuntu-latest
-    timeout-minutes: 5   # posting itself should take well under a minute;
-                          # this is a safety ceiling, not an expected duration
+    timeout-minutes: 8   # posting itself takes well under a minute, but
+                          # installing chromium + its system deps can take
+                          # 2-4 minutes on a fresh runner — this accounts
+                          # for setup time, not just the posting action
 
     steps:
       - name: Checkout repository
@@ -49,7 +51,13 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          playwright install --with-deps chromium
+          # Use 'python -m playwright' instead of bare 'playwright' — the bare
+          # command relies on the package's CLI script being on PATH, which
+          # isn't always true right after pip install in the same shell step
+          # on GitHub's hosted runners. 'python -m' always works since it just
+          # asks the same Python interpreter we just installed the package
+          # into to run it as a module.
+          python -m playwright install --with-deps chromium
 
       - name: Restore database cache
         uses: actions/cache@v4

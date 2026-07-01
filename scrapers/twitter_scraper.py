@@ -33,6 +33,7 @@ from config.settings import (
     KEYWORDS, MIN_ENGAGEMENT,
     REQUEST_TIMEOUT, REQUEST_DELAY,
     TWITTER_SCRAPE_TIME_BUDGET,
+    SKIP_TWITTER_SCRAPING,
 )
 from data.database import save_post, log_run
 
@@ -131,6 +132,15 @@ def scrape_twitter() -> dict:
     Returns a summary dict.
     """
     started_at    = datetime.utcnow().isoformat()
+
+    if SKIP_TWITTER_SCRAPING:
+        logger.info(
+            "Twitter scraping skipped (SKIP_TWITTER_SCRAPING=True in settings.py). "
+            "Nitter is structurally dead as of July 2026 — all public instances "
+            "403 from GitHub Actions IPs. Twitter content is posted manually."
+        )
+        return {"source": "twitter", "posts_found": 0, "posts_new": 0, "errors": []}
+
     run_start_ts  = time.monotonic()
     total_found   = 0
     total_new     = 0

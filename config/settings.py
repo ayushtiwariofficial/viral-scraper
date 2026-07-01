@@ -34,6 +34,14 @@ NITTER_INSTANCES = [
     "https://nitter.tiekoetter.com",
 ]
 
+# STATUS (July 2026): Nitter is structurally dead. X/Twitter removed the
+# unauthenticated API all public instances depended on. Every instance
+# consistently 403s from GitHub Actions IPs. Setting this to True skips
+# Twitter scraping entirely rather than wasting 3 minutes per run timing
+# out. The pipeline works fine without it — RSS + Reddit + LinkedIn
+# provide plenty of source material, and Twitter posts are manual anyway.
+SKIP_TWITTER_SCRAPING = True
+
 # ── Twitter accounts to scrape via Nitter ───────────────────
 TWITTER_ACCOUNTS = [
     "levelsio",         # indie hacker, building in public
@@ -60,24 +68,10 @@ REDDIT_SUBREDDITS = [
     "SideProject",
 ]
 
-# Reddit OAuth credentials — required as of May 2026, when Reddit
-# deprecated unauthenticated .json endpoint access entirely (it now
-# returns a hard 403 for all unauthenticated requests, regardless of
-# headers or IP — this isn't a bug we can work around, it's a policy
-# change). Free OAuth "script" apps still get 60-100 req/min for free,
-# no business justification needed at this volume.
-#
-# To get these (5 minutes, free):
-#   1. Go to https://www.reddit.com/prefs/apps
-#   2. Click "create another app..." at the bottom
-#   3. Select "script" as the app type
-#   4. Set redirect URI to http://localhost:8080 (required but unused)
-#   5. Click "create app"
-#   6. Copy the string under your app's name (that's the CLIENT_ID)
-#   7. Copy the "secret" field (that's the CLIENT_SECRET)
-#   8. Add REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME,
-#      REDDIT_PASSWORD to your .env file and as GitHub Actions secrets
-# Read via config/settings.py below — actual values come from os.getenv()
+# Reddit uses its public .rss endpoint — no credentials needed.
+# https://www.reddit.com/r/{subreddit}/hot.rss?limit=25
+# These survived Reddit's 2023 API pricing changes and still work in 2026.
+# See scrapers/reddit_scraper.py for the implementation.
 
 # ── RSS feeds (newsletters & blogs) ─────────────────────────
 RSS_FEEDS = [
