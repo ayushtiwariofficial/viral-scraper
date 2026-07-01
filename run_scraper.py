@@ -206,6 +206,14 @@ def main():
     parser.add_argument("--skip-notify",   action="store_true", help="Skip sending notifications about ready content")
     parser.add_argument("--notify-only",   action="store_true", help="Run notifications only, skip everything else")
     parser.add_argument(
+        "--list", action="store_true",
+        help="List all posts in the content queue with their IDs, status, and a short preview"
+    )
+    parser.add_argument(
+        "--preview", type=int, metavar="ID",
+        help="Show the full content of a content_queue ID (useful before approving LinkedIn posts)"
+    )
+    parser.add_argument(
         "--mark-twitter-posted", type=int, metavar="ID",
         help="Mark a content_queue ID as manually posted to Twitter (Twitter posting is manual — see settings.py)"
     )
@@ -213,6 +221,83 @@ def main():
 
     # Always init DB first
     init_db()
+
+    if args.list:
+        from data.database import get_db
+        import json as _json
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT cq.id, cq.approval_status, cq.posted_linkedin, cq.posted_twitter,
+                       cq.created_at, cq.linkedin_post, cq.twitter_thread, cq.hashtags,
+                       r.source, r.author
+                FROM content_queue cq
+                JOIN raw_posts r ON r.id = cq.raw_post_id
+                ORDER BY cq.id DESC
+                """
+            ).fetchall()
+        if not rows:
+            print("Content queue is empty.")
+            return
+        print(f"\n{'ID':<5} {'Source':<20} {'Approval':<10} {'LI':<5} {'TW':<5} {'Created':<12}  Preview")
+        print("-" * 100)
+        for r in rows:
+            try:
+                thread = _json.loads(r["twitter_thread"] or "[]")
+                preview = thread[0][:60] if thread else (r["linkedin_post"] or "")[:60]
+            except Exception:
+                preview = (r["linkedin_post"] or "")[:60]
+            source = f"{r['source']}/{r['author'] or '?'}"[:20]
+            created = (r["created_at"] or "")[:10]
+            li = "✓" if r["posted_linkedin"] else ("rej" if r["approval_status"] == "rejected" else "pend")
+            tw = "✓" if r["posted_twitter"] else "-"
+            print(f"{r['id']:<5} {source:<20} {r['approval_status']:<10} {li:<5} {tw:<5} {created:<12}  {preview}...")
+        print(f"\nTotal: {len(rows)} posts  |  Run: python run_scraper.py --preview <ID>  to see full content")
+        print()
+        return
+
+    if args.preview:
+        from data.database import get_content_by_id
+        import json as _json
+        row = get_content_by_id(args.preview)
+        if not row:
+            print(f"No content found with ID #{args.preview}")
+            return
+        row = dict(row)
+
+        # twitter_thread is stored as a JSON-encoded list in the DB
+        raw_thread = row.get("twitter_thread") or "[]"
+        try:
+            thread = _json.loads(raw_thread)
+            if not isinstance(thread, list):
+                thread = [str(thread)]
+        except Exception:
+            thread = [raw_thread]
+
+        # hashtags is stored as a comma-separated string
+        hashtags = row.get("hashtags") or ""
+        tag_list = [t.strip() for t in hashtags.split(",") if t.strip()]
+
+        print(f"\n{'='*60}")
+        print(f"Post #{row['id']}  |  {row.get('original_source','?')}/{row.get('original_author','?')}")
+        print(f"Status: {row.get('approval_status','?')}  |  LinkedIn posted: {'✓' if row.get('posted_linkedin') else 'No'}  |  Twitter posted: {'✓' if row.get('posted_twitter') else 'No'}")
+        print(f"{'='*60}")
+        print(f"\n🐦 TWITTER THREAD ({len(thread)} tweets):\n")
+        for i, tweet in enumerate(thread, 1):
+            print(f"  [{i}/{len(thread)}]")
+            print(f"  {tweet}")
+            print()
+        print(f"{'─'*60}")
+        print(f"\n💼 LINKEDIN POST:\n")
+        print(row.get("linkedin_post", "(none)"))
+        print(f"\n{'─'*60}")
+        if tag_list:
+            print(f"\n🏷  HASHTAGS: {'  '.join('#'+t for t in tag_list)}")
+        src_url = row.get("original_url")
+        if src_url:
+            print(f"🔗 Source: {src_url}")
+        print()
+        return
 
     if args.mark_twitter_posted:
         from data.database import mark_posted_twitter
