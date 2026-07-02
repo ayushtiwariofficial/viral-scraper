@@ -1,5 +1,5 @@
 # ============================================================
-#  .github/workflows/scraper.yml  —  FIXED VERSION
+#  .github/workflows/scraper.yml
 # ============================================================
 
 name: 🤖 Viral Content Scraper
@@ -8,7 +8,7 @@ on:
   schedule:
     - cron: '0 */2 * * *'    # every 2 hours
 
-  workflow_dispatch:           # manual trigger from GitHub UI
+  workflow_dispatch:
     inputs:
       source:
         description: 'Scrape one source only (blank = all)'
@@ -29,113 +29,94 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      # 1. Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Python setup
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # 3. Install deps
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 4. Restore cached DB (persists data between runs)
-      - name: Restore database cache
-        id: cache-db
-        uses: actions/cache@v4
+      # ── Restore DB ──────────────────────────────────────────
+      # We use a NAMED ARTIFACT called 'viral-scraper-db' that gets
+      # overwritten every run. This solves the core problem with
+      # actions/cache: cache only saves a new entry when the key
+      # doesn't already exist, so after the first run the DB is
+      # NEVER updated — every subsequent run sees the same empty
+      # or stale DB. Named artifacts with overwrite:true always
+      # have the latest data and are shared across all workflows.
+      - name: Restore database from artifact
+        uses: actions/download-artifact@v4
         with:
-          path: data/posts.db
-          key: posts-db-${{ github.ref_name }}
-          restore-keys: posts-db-
+          name: viral-scraper-db
+          path: data/
+        continue-on-error: true   # first ever run has no artifact yet — that's OK
 
-      # 5. Create ALL required directories upfront
       - name: Create required directories
         run: |
-          mkdir -p data logs config scrapers ai
-          # Ensure __init__.py files exist (in case they're missing from repo)
-          touch config/__init__.py
-          touch data/__init__.py
-          touch scrapers/__init__.py
-          touch ai/__init__.py
-          # Create empty log file so upload never fails
+          mkdir -p data logs config scrapers ai poster
+          touch config/__init__.py data/__init__.py scrapers/__init__.py
+          touch ai/__init__.py poster/__init__.py
           touch logs/scraper.log
 
-      # 6. Verify structure before running (helps debug)
       - name: Show project structure
         run: |
-          echo "=== Project files ==="
-          find . -not -path './.git/*' -name "*.py" | sort
-          echo ""
-          echo "=== Python version ==="
-          python --version
+          echo "=== DB status ==="
+          ls -lh data/ 2>/dev/null || echo "data/ is empty (first run)"
           echo ""
           echo "=== Testing imports ==="
           python -c "
-          import sys, os
+          import sys
           sys.path.insert(0, '.')
           from config.settings import KEYWORDS, TWITTER_ACCOUNTS
           from data.database import init_db
           from ai.scorer import score_posts, build_queue
           from ai.rewriter import rewrite_posts
+          from poster.notifier import notify_ready_content
           init_db()
-          print('✓ All imports OK (scrapers + AI scoring + AI rewriting)')
-          print(f'✓ {len(KEYWORDS)} keywords loaded')
-          print(f'✓ {len(TWITTER_ACCOUNTS)} Twitter accounts configured')
+          print('✓ All imports OK')
+          print(f'✓ {len(KEYWORDS)} keywords, {len(TWITTER_ACCOUNTS)} Twitter accounts')
           "
 
-      # 7. Run the scraper
       - name: Run scraper
-        timeout-minutes: 10   # leaves headroom in the 15-min job budget for cleanup steps
+        timeout-minutes: 10
         env:
-          GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
-          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
-          NTFY_TOPIC:           ${{ secrets.NTFY_TOPIC }}
-          REDDIT_CLIENT_ID:     ${{ secrets.REDDIT_CLIENT_ID }}
-          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          REDDIT_USERNAME:      ${{ secrets.REDDIT_USERNAME }}
-          REDDIT_PASSWORD:      ${{ secrets.REDDIT_PASSWORD }}
+          GROQ_API_KEY:   ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NTFY_TOPIC:     ${{ secrets.NTFY_TOPIC }}
         run: |
           SOURCE="${{ github.event.inputs.source }}"
           if [ -n "$SOURCE" ]; then
-            echo "Running single source: $SOURCE"
             python run_scraper.py --source "$SOURCE"
           else
-            echo "Running all sources"
             python run_scraper.py
           fi
 
-      # 8. Show stats
       - name: Show collection stats
         run: python run_scraper.py --stats
 
-      # 9. Save DB back to cache
-      - name: Save database to cache
-        uses: actions/cache@v4
-        with:
-          path: data/posts.db
-          key: posts-db-${{ github.ref_name }}
-
-      # 10. Upload DB snapshot (always, even on failure)
-      - name: Upload database snapshot
+      # ── Save DB ─────────────────────────────────────────────
+      # overwrite: true ensures this always replaces the previous
+      # artifact — the approval workflow will always get the latest DB.
+      - name: Save database to artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: posts-db-run-${{ github.run_number }}
+          name: viral-scraper-db
           path: data/posts.db
-          if-no-files-found: ignore    # ← won't fail if DB not created
-          retention-days: 7
+          overwrite: true           # ← key: replaces previous version
+          if-no-files-found: ignore
+          retention-days: 90        # keep 90 days of DB history
 
-      # 11. Upload logs (always, even on failure)
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: logs-run-${{ github.run_number }}
           path: logs/scraper.log
-          if-no-files-found: ignore    # ← won't fail if log is empty
+          if-no-files-found: ignore
           retention-days: 3

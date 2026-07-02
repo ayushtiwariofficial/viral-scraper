@@ -1,15 +1,16 @@
 # ============================================================
 #  .github/workflows/linkedin-approve.yml
 #
-#  Manually-triggered workflow to approve and post a specific
-#  piece of content to LinkedIn. This is the ONLY path that
-#  posts to LinkedIn — there is no scheduled/automatic posting.
+#  Manually approve and post a specific piece of content to
+#  LinkedIn. This is the ONLY path to LinkedIn posting —
+#  nothing posts automatically without your explicit approval.
 #
 #  Usage:
-#    1. Check your notifications (ntfy) or run
-#       `python run_scraper.py --stats` to find a content ID
-#    2. Go to Actions tab -> "Approve & Post to LinkedIn" -> Run workflow
-#    3. Enter the content ID and action (approve/reject)
+#    1. Check ntfy notifications for a post ID
+#       OR run: python run_scraper.py --list
+#       OR run: python run_scraper.py --preview <ID>
+#    2. Actions tab → "Approve & Post to LinkedIn" → Run workflow
+#    3. Enter the content ID and choose approve/reject
 # ============================================================
 
 name: 💼 Approve & Post to LinkedIn
@@ -18,11 +19,11 @@ on:
   workflow_dispatch:
     inputs:
       content_id:
-        description: 'Content queue ID to approve/reject (from notification or --stats)'
+        description: 'Content queue ID (from ntfy notification or --list)'
         required: true
         type: string
       action:
-        description: 'What to do with this content'
+        description: 'What to do with this post'
         required: true
         type: choice
         options:
@@ -33,10 +34,7 @@ jobs:
   approve-and-post:
     name: Process LinkedIn approval
     runs-on: ubuntu-latest
-    timeout-minutes: 8   # posting itself takes well under a minute, but
-                          # installing chromium + its system deps can take
-                          # 2-4 minutes on a fresh runner — this accounts
-                          # for setup time, not just the posting action
+    timeout-minutes: 8
 
     steps:
       - name: Checkout repository
@@ -51,75 +49,94 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          # Use 'python -m playwright' instead of bare 'playwright' — the bare
-          # command relies on the package's CLI script being on PATH, which
-          # isn't always true right after pip install in the same shell step
-          # on GitHub's hosted runners. 'python -m' always works since it just
-          # asks the same Python interpreter we just installed the package
-          # into to run it as a module.
           python -m playwright install --with-deps chromium
 
-      - name: Restore database cache
-        uses: actions/cache@v4
+      # ── Restore DB (same artifact as scraper uses) ──────────
+      # Downloads the latest 'viral-scraper-db' artifact saved
+      # by the scraper workflow. Because scraper.yml uses
+      # overwrite:true, this is always the most up-to-date DB
+      # with the post IDs your ntfy notifications referred to.
+      - name: Restore database from artifact
+        uses: actions/download-artifact@v4
         with:
-          path: data/posts.db
-          key: posts-db-${{ github.ref_name }}
-          restore-keys: posts-db-
+          name: viral-scraper-db
+          path: data/
+        continue-on-error: false    # MUST have the DB — fail clearly if missing
 
+      - name: Create required directories
+        run: |
+          mkdir -p data logs config scrapers ai poster
+          touch config/__init__.py data/__init__.py scrapers/__init__.py
+          touch ai/__init__.py poster/__init__.py
+          touch logs/scraper.log
+
+      # ── DB sanity check ─────────────────────────────────────
+      - name: Verify post exists in database
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from data.database import init_db, get_content_by_id
+          init_db()
+          row = get_content_by_id(${{ inputs.content_id }})
+          if not row:
+              print('ERROR: Post #${{ inputs.content_id }} not found in database.')
+              print()
+              print('This usually means:')
+              print('  1. The post ID is from a different DB snapshot')
+              print('  2. The scraper workflow has not run yet after your last code push')
+              print('  3. The post was already posted or rejected')
+              print()
+              print('Run the main scraper workflow first, then check --list for valid IDs.')
+              sys.exit(1)
+          row = dict(row)
+          print(f'✓ Found post #{row[\"id\"]}')
+          print(f'  Source: {row.get(\"original_source\",\"?\")} / {row.get(\"original_author\",\"?\")}')
+          print(f'  Approval status: {row.get(\"approval_status\",\"?\")}')
+          print(f'  LinkedIn posted: {bool(row.get(\"posted_linkedin\"))}')
+          if row.get('approval_status') == 'rejected':
+              print('ERROR: This post was previously rejected.')
+              sys.exit(1)
+          if row.get('posted_linkedin'):
+              print('ERROR: This post was already posted to LinkedIn.')
+              sys.exit(1)
+          "
+
+      # ── Restore LinkedIn session ─────────────────────────────
       - name: Restore LinkedIn session
         env:
           LINKEDIN_SESSION_B64: ${{ secrets.LINKEDIN_SESSION_B64 }}
         run: |
           mkdir -p data
           if [ -z "$LINKEDIN_SESSION_B64" ]; then
-            echo "::error::LINKEDIN_SESSION_B64 secret is not set. Run 'python -m poster.linkedin_poster --login' "
-            echo "::error::locally first, then base64-encode data/linkedin_session.json and save it as a secret."
+            echo "::error::LINKEDIN_SESSION_B64 not set."
+            echo "::error::Run 'python -m poster.linkedin_poster --login' locally first."
             exit 1
           fi
-
-          # Use Python for base64 decoding instead of the shell 'base64 -d' command.
-          # Python's base64.b64decode(validate=False) strips whitespace/newlines
-          # automatically, making it robust regardless of how the secret was encoded
-          # (Mac 'base64 -i file | tr -d newlines', Windows PowerShell
-          # [Convert]::ToBase64String(), or any other method).
-          # The shell 'base64 -d' on Linux is strict and rejects embedded newlines,
-          # which is the most common cause of 'base64: invalid input' errors.
           python3 -c "
-          import base64, os, sys
-
+          import base64, os, sys, json
           raw = os.environ.get('LINKEDIN_SESSION_B64', '')
-          if not raw:
-              print('ERROR: LINKEDIN_SESSION_B64 is empty', file=sys.stderr)
-              sys.exit(1)
-
           try:
-              # ignore_garbage=True strips whitespace, newlines, and other
-              # non-base64 characters that commonly get embedded when copying
-              # from a terminal or saving via different OS tools
               decoded = base64.b64decode(raw, validate=False)
           except Exception as e:
               print(f'ERROR: Could not decode base64 session: {e}', file=sys.stderr)
               sys.exit(1)
-
-          # Quick sanity check — the decoded content should be valid JSON
-          import json
           try:
               parsed = json.loads(decoded)
-              if 'cookies' not in parsed:
-                  print('WARNING: Decoded session has no cookies — session may be empty')
+              cookies = parsed.get('cookies', [])
+              if not cookies:
+                  print('WARNING: Session has no cookies — re-run --login')
           except json.JSONDecodeError as e:
-              print(f'ERROR: Decoded base64 is not valid JSON: {e}', file=sys.stderr)
-              print('This usually means the session file was not fully written before encoding.')
-              print('Re-run: python -m poster.linkedin_poster --login')
+              print(f'ERROR: Session is not valid JSON: {e}', file=sys.stderr)
+              print('Re-run: python -m poster.linkedin_poster --login', file=sys.stderr)
               sys.exit(1)
-
           os.makedirs('data', exist_ok=True)
           with open('data/linkedin_session.json', 'wb') as f:
               f.write(decoded)
-
-          print(f'Session restored ({len(parsed.get(\"cookies\", []))} cookies)')
+          print(f'✓ Session restored ({len(cookies)} cookies)')
           "
 
+      # ── Approve or reject ────────────────────────────────────
       - name: Process approval
         run: |
           if [ "${{ inputs.action }}" = "approve" ]; then
@@ -128,12 +145,16 @@ jobs:
             python -m poster.linkedin_poster --reject "${{ inputs.content_id }}"
           fi
 
-      - name: Save database to cache
+      # ── Save updated DB back (marks post as posted/rejected) ─
+      - name: Save updated database to artifact
         if: always()
-        uses: actions/cache@v4
+        uses: actions/upload-artifact@v4
         with:
+          name: viral-scraper-db
           path: data/posts.db
-          key: posts-db-${{ github.ref_name }}
+          overwrite: true
+          if-no-files-found: ignore
+          retention-days: 90
 
       - name: Upload logs
         if: always()
