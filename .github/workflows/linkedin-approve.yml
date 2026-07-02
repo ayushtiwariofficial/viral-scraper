@@ -76,7 +76,49 @@ jobs:
             echo "::error::locally first, then base64-encode data/linkedin_session.json and save it as a secret."
             exit 1
           fi
-          echo "$LINKEDIN_SESSION_B64" | base64 -d > data/linkedin_session.json
+
+          # Use Python for base64 decoding instead of the shell 'base64 -d' command.
+          # Python's base64.b64decode(validate=False) strips whitespace/newlines
+          # automatically, making it robust regardless of how the secret was encoded
+          # (Mac 'base64 -i file | tr -d newlines', Windows PowerShell
+          # [Convert]::ToBase64String(), or any other method).
+          # The shell 'base64 -d' on Linux is strict and rejects embedded newlines,
+          # which is the most common cause of 'base64: invalid input' errors.
+          python3 -c "
+          import base64, os, sys
+
+          raw = os.environ.get('LINKEDIN_SESSION_B64', '')
+          if not raw:
+              print('ERROR: LINKEDIN_SESSION_B64 is empty', file=sys.stderr)
+              sys.exit(1)
+
+          try:
+              # ignore_garbage=True strips whitespace, newlines, and other
+              # non-base64 characters that commonly get embedded when copying
+              # from a terminal or saving via different OS tools
+              decoded = base64.b64decode(raw, validate=False)
+          except Exception as e:
+              print(f'ERROR: Could not decode base64 session: {e}', file=sys.stderr)
+              sys.exit(1)
+
+          # Quick sanity check — the decoded content should be valid JSON
+          import json
+          try:
+              parsed = json.loads(decoded)
+              if 'cookies' not in parsed:
+                  print('WARNING: Decoded session has no cookies — session may be empty')
+          except json.JSONDecodeError as e:
+              print(f'ERROR: Decoded base64 is not valid JSON: {e}', file=sys.stderr)
+              print('This usually means the session file was not fully written before encoding.')
+              print('Re-run: python -m poster.linkedin_poster --login')
+              sys.exit(1)
+
+          os.makedirs('data', exist_ok=True)
+          with open('data/linkedin_session.json', 'wb') as f:
+              f.write(decoded)
+
+          print(f'Session restored ({len(parsed.get(\"cookies\", []))} cookies)')
+          "
 
       - name: Process approval
         run: |
