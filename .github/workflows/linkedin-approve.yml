@@ -1,18 +1,3 @@
-# ============================================================
-#  .github/workflows/linkedin-approve.yml
-#
-#  Manually approve and post a specific piece of content to
-#  LinkedIn. This is the ONLY path to LinkedIn posting —
-#  nothing posts automatically without your explicit approval.
-#
-#  Usage:
-#    1. Check ntfy notifications for a post ID
-#       OR run: python run_scraper.py --list
-#       OR run: python run_scraper.py --preview <ID>
-#    2. Actions tab → "Approve & Post to LinkedIn" → Run workflow
-#    3. Enter the content ID and choose approve/reject
-# ============================================================
-
 name: 💼 Approve & Post to LinkedIn
 
 on:
@@ -26,15 +11,15 @@ on:
         description: 'What to do with this post'
         required: true
         type: choice
-        options:
-          - approve
-          - reject
+        options: [approve, reject]
 
 jobs:
   approve-and-post:
     name: Process LinkedIn approval
     runs-on: ubuntu-latest
     timeout-minutes: 8
+    permissions:
+      actions: read    # needed to read artifacts via the API
 
     steps:
       - name: Checkout repository
@@ -51,26 +36,20 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      # ── Restore DB (same artifact as scraper uses) ──────────
-      # Downloads the latest 'viral-scraper-db' artifact saved
-      # by the scraper workflow. Because scraper.yml uses
-      # overwrite:true, this is always the most up-to-date DB
-      # with the post IDs your ntfy notifications referred to.
-      - name: Restore database from artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: viral-scraper-db
-          path: data/
-        continue-on-error: false    # MUST have the DB — fail clearly if missing
-
       - name: Create required directories
         run: |
           mkdir -p data logs config scrapers ai poster
           touch config/__init__.py data/__init__.py scrapers/__init__.py
-          touch ai/__init__.py poster/__init__.py
-          touch logs/scraper.log
+          touch ai/__init__.py poster/__init__.py logs/scraper.log
 
-      # ── DB sanity check ─────────────────────────────────────
+      # Download latest DB via GitHub API — same script as scraper.yml
+      - name: Restore database
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python .github/scripts/download_db.py
+          ls -lh data/
+
       - name: Verify post exists in database
         run: |
           python -c "
@@ -81,62 +60,44 @@ jobs:
           row = get_content_by_id(${{ inputs.content_id }})
           if not row:
               print('ERROR: Post #${{ inputs.content_id }} not found in database.')
-              print()
-              print('This usually means:')
-              print('  1. The post ID is from a different DB snapshot')
-              print('  2. The scraper workflow has not run yet after your last code push')
-              print('  3. The post was already posted or rejected')
-              print()
-              print('Run the main scraper workflow first, then check --list for valid IDs.')
+              print('Run the main scraper workflow first, then check ntfy or --list for valid IDs.')
               sys.exit(1)
           row = dict(row)
-          print(f'✓ Found post #{row[\"id\"]}')
-          print(f'  Source: {row.get(\"original_source\",\"?\")} / {row.get(\"original_author\",\"?\")}')
-          print(f'  Approval status: {row.get(\"approval_status\",\"?\")}')
-          print(f'  LinkedIn posted: {bool(row.get(\"posted_linkedin\"))}')
+          print(f'Post #{row[\"id\"]} | {row.get(\"original_source\",\"?\")} / {row.get(\"original_author\",\"?\")}')
+          print(f'Approval: {row.get(\"approval_status\",\"?\")} | LinkedIn posted: {bool(row.get(\"posted_linkedin\"))}')
           if row.get('approval_status') == 'rejected':
               print('ERROR: This post was previously rejected.')
               sys.exit(1)
           if row.get('posted_linkedin'):
               print('ERROR: This post was already posted to LinkedIn.')
               sys.exit(1)
+          print('✓ Post is valid and ready for approval')
           "
 
-      # ── Restore LinkedIn session ─────────────────────────────
       - name: Restore LinkedIn session
         env:
           LINKEDIN_SESSION_B64: ${{ secrets.LINKEDIN_SESSION_B64 }}
         run: |
-          mkdir -p data
-          if [ -z "$LINKEDIN_SESSION_B64" ]; then
-            echo "::error::LINKEDIN_SESSION_B64 not set."
-            echo "::error::Run 'python -m poster.linkedin_poster --login' locally first."
-            exit 1
-          fi
           python3 -c "
           import base64, os, sys, json
           raw = os.environ.get('LINKEDIN_SESSION_B64', '')
-          try:
-              decoded = base64.b64decode(raw, validate=False)
-          except Exception as e:
-              print(f'ERROR: Could not decode base64 session: {e}', file=sys.stderr)
+          if not raw:
+              print('ERROR: LINKEDIN_SESSION_B64 not set.', file=sys.stderr)
+              print('Run: python -m poster.linkedin_poster --login', file=sys.stderr)
               sys.exit(1)
           try:
-              parsed = json.loads(decoded)
-              cookies = parsed.get('cookies', [])
-              if not cookies:
-                  print('WARNING: Session has no cookies — re-run --login')
-          except json.JSONDecodeError as e:
-              print(f'ERROR: Session is not valid JSON: {e}', file=sys.stderr)
+              decoded = base64.b64decode(raw, validate=False)
+              parsed  = json.loads(decoded)
+          except Exception as e:
+              print(f'ERROR: Bad session data: {e}', file=sys.stderr)
               print('Re-run: python -m poster.linkedin_poster --login', file=sys.stderr)
               sys.exit(1)
           os.makedirs('data', exist_ok=True)
           with open('data/linkedin_session.json', 'wb') as f:
               f.write(decoded)
-          print(f'✓ Session restored ({len(cookies)} cookies)')
+          print(f'✓ Session restored ({len(parsed.get(\"cookies\",[]))} cookies)')
           "
 
-      # ── Approve or reject ────────────────────────────────────
       - name: Process approval
         run: |
           if [ "${{ inputs.action }}" = "approve" ]; then
@@ -145,8 +106,8 @@ jobs:
             python -m poster.linkedin_poster --reject "${{ inputs.content_id }}"
           fi
 
-      # ── Save updated DB back (marks post as posted/rejected) ─
-      - name: Save updated database to artifact
+      # Save updated DB so the posted/rejected status persists
+      - name: Save updated database artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:

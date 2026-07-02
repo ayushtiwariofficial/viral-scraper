@@ -1,13 +1,8 @@
-# ============================================================
-#  .github/workflows/scraper.yml
-# ============================================================
-
 name: 🤖 Viral Content Scraper
 
 on:
   schedule:
-    - cron: '0 */2 * * *'    # every 2 hours
-
+    - cron: '0 */2 * * *'
   workflow_dispatch:
     inputs:
       source:
@@ -15,18 +10,15 @@ on:
         required: false
         default: ''
         type: choice
-        options:
-          - ''
-          - twitter
-          - reddit
-          - rss
-          - linkedin
+        options: ['', 'twitter', 'reddit', 'rss', 'linkedin']
 
 jobs:
   scrape:
     name: Run scrapers
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      actions: read    # needed to read artifacts via the API
 
     steps:
       - name: Checkout repository
@@ -41,37 +33,28 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── Restore DB ──────────────────────────────────────────
-      # We use a NAMED ARTIFACT called 'viral-scraper-db' that gets
-      # overwritten every run. This solves the core problem with
-      # actions/cache: cache only saves a new entry when the key
-      # doesn't already exist, so after the first run the DB is
-      # NEVER updated — every subsequent run sees the same empty
-      # or stale DB. Named artifacts with overwrite:true always
-      # have the latest data and are shared across all workflows.
-      - name: Restore database from artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: viral-scraper-db
-          path: data/
-        continue-on-error: true   # first ever run has no artifact yet — that's OK
-
       - name: Create required directories
         run: |
           mkdir -p data logs config scrapers ai poster
           touch config/__init__.py data/__init__.py scrapers/__init__.py
-          touch ai/__init__.py poster/__init__.py
-          touch logs/scraper.log
+          touch ai/__init__.py poster/__init__.py logs/scraper.log
 
-      - name: Show project structure
+      # Download latest DB artifact via the GitHub API.
+      # actions/download-artifact@v4 only sees artifacts from the
+      # CURRENT run — it can't find artifacts from previous runs.
+      # Our Python script uses the REST API to find the latest
+      # 'viral-scraper-db' artifact across ALL runs.
+      - name: Restore database
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== DB status ==="
-          ls -lh data/ 2>/dev/null || echo "data/ is empty (first run)"
-          echo ""
-          echo "=== Testing imports ==="
+          python .github/scripts/download_db.py || echo "No previous DB found (first run) — starting fresh"
+          ls -lh data/ 2>/dev/null || echo "data/ is empty"
+
+      - name: Verify project structure
+        run: |
           python -c "
-          import sys
-          sys.path.insert(0, '.')
+          import sys; sys.path.insert(0, '.')
           from config.settings import KEYWORDS, TWITTER_ACCOUNTS
           from data.database import init_db
           from ai.scorer import score_posts, build_queue
@@ -79,7 +62,6 @@ jobs:
           from poster.notifier import notify_ready_content
           init_db()
           print('✓ All imports OK')
-          print(f'✓ {len(KEYWORDS)} keywords, {len(TWITTER_ACCOUNTS)} Twitter accounts')
           "
 
       - name: Run scraper
@@ -99,18 +81,17 @@ jobs:
       - name: Show collection stats
         run: python run_scraper.py --stats
 
-      # ── Save DB ─────────────────────────────────────────────
-      # overwrite: true ensures this always replaces the previous
-      # artifact — the approval workflow will always get the latest DB.
-      - name: Save database to artifact
+      # Upload updated DB — overwrite:true replaces the previous version
+      # so the approval workflow always gets the latest data
+      - name: Save database artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: viral-scraper-db
           path: data/posts.db
-          overwrite: true           # ← key: replaces previous version
+          overwrite: true
           if-no-files-found: ignore
-          retention-days: 90        # keep 90 days of DB history
+          retention-days: 90
 
       - name: Upload logs
         if: always()
