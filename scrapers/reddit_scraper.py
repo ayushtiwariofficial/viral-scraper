@@ -17,6 +17,7 @@
 # ============================================================
 
 import feedparser
+import httpx
 import logging
 import time
 import re
@@ -34,7 +35,11 @@ logger = logging.getLogger(__name__)
 
 REDDIT_RSS_BASE = "https://www.reddit.com/r/{sub}/hot.rss?limit=25"
 REDDIT_HEADERS  = {
-    "User-Agent": "viral-scraper/1.0 (educational project; uses public RSS only)"
+    # Reddit requires a descriptive User-Agent — generic ones get rate-limited
+    "User-Agent": "viral-scraper/1.0 (educational project; RSS reader)",
+    # Explicitly request RSS/Atom content — without this some subreddits
+    # return HTML (which feedparser then parses as 0 entries)
+    "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
 }
 
 
@@ -99,10 +104,24 @@ def scrape_reddit() -> dict:
     for subreddit in REDDIT_SUBREDDITS:
         url = REDDIT_RSS_BASE.format(sub=subreddit)
         try:
-            feed = feedparser.parse(
+            # Use httpx directly instead of letting feedparser do the HTTP
+            # request internally via urllib. feedparser's urllib fetching
+            # doesn't reliably send headers on redirects, which causes
+            # Reddit to return HTML error pages (parsed as 0 entries) for
+            # most subreddits. httpx correctly forwards headers through
+            # redirects and has a proper timeout.
+            resp = httpx.get(
                 url,
-                request_headers=REDDIT_HEADERS,
+                headers=REDDIT_HEADERS,
+                timeout=10,
+                follow_redirects=True,
             )
+            if resp.status_code != 200:
+                logger.warning(f"r/{subreddit}: HTTP {resp.status_code}")
+                continue
+
+            # Pass raw text to feedparser just for XML parsing
+            feed = feedparser.parse(resp.text)
 
             if feed.bozo and not feed.entries:
                 raise ValueError(f"Bad feed: {feed.bozo_exception}")

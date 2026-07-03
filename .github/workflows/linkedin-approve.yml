@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     permissions:
-      actions: read    # needed to read artifacts via the API
+      actions: write   # write needed to download artifact zip files via the API
 
     steps:
       - name: Checkout repository

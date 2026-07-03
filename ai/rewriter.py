@@ -40,7 +40,10 @@ GEMINI_API_URL = (
 )
 
 MAX_RETRIES = 3
-RATE_LIMIT_DELAY = 2.0   # Gemini 2.5 Flash free tier: ~10 RPM, so pace gently
+RATE_LIMIT_DELAY = 7.0   # Gemini free tier: 10 RPM = 1 req/6s minimum.
+                          # 7s gives comfortable headroom (≈8.5 RPM) and
+                          # reduces daily quota usage. Was 2.0s which caused
+                          # persistent 429s (4/5 rewrites failing every run).
 
 
 # ── Prompt ────────────────────────────────────────────────────
@@ -108,7 +111,8 @@ def call_gemini(prompt: str, max_retries: int = MAX_RETRIES) -> dict | None:
                 resp = client.post(GEMINI_API_URL, headers=headers, params=params, json=payload)
 
             if resp.status_code == 429:
-                wait = 10 * attempt
+                wait = 15 * attempt   # 15s, 30s, 45s — gives the 10 RPM window
+                                       # time to clear before retrying
                 logger.warning(f"Gemini rate limited — waiting {wait}s (attempt {attempt})")
                 time.sleep(wait)
                 continue

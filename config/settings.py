@@ -76,7 +76,7 @@ REDDIT_SUBREDDITS = [
 # ── RSS feeds (newsletters & blogs) ─────────────────────────
 RSS_FEEDS = [
     "https://www.bensbites.com/feed",                        # AI newsletter
-    "https://tldr.tech/ai/rss",                              # TLDR AI
+    "https://tldr.tech/api/rss/ai",                          # TLDR AI (corrected URL)
     "https://www.deeplearning.ai/the-batch/feed/",           # The Batch
     "https://feeds.feedburner.com/oreilly/radar/atom",       # O'Reilly radar
     "https://hackernoon.com/feed",                           # Hacker Noon
