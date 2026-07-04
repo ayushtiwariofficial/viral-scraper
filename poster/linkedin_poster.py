@@ -115,16 +115,44 @@ def post_to_linkedin(text: str, max_retries: int = 2) -> str | None:
                 context = browser.new_context(storage_state=LINKEDIN_SESSION_PATH)
                 page = context.new_page()
 
-                page.goto(LINKEDIN_POST_URL, wait_until="networkidle", timeout=30000)
+                # IMPORTANT: don't wait for "networkidle" here. LinkedIn's feed
+                # page has continuous background network activity (real-time
+                # notification polling, presence pings, infinite-scroll
+                # prefetching) that never actually goes idle — Playwright's own
+                # docs warn "pages with continuous polling... may never reach
+                # network idle." Waiting for it just guarantees a 30s timeout
+                # on every single run, valid session or not (confirmed this
+                # was misdiagnosing healthy sessions as "expired", because the
+                # timeout fires mid-navigation while LinkedIn is still doing
+                # its normal auth-refresh redirect dance).
+                #
+                # Instead: wait only for domcontentloaded (fast, reliable),
+                # then wait for a concrete element that proves we're actually
+                # on a logged-in feed page.
+                page.goto(LINKEDIN_POST_URL, wait_until="domcontentloaded", timeout=30000)
 
-                # Detect an expired session early with a clear error, rather
-                # than failing confusingly later trying to find UI elements
-                # that don't exist on the login page.
-                if "login" in page.url or "checkpoint" in page.url:
+                try:
+                    # "Start a post" button only exists on the logged-in feed.
+                    # If this appears, we know for certain the session is valid
+                    # and the page is genuinely ready to interact with —
+                    # far more reliable than checking page.url or networkidle.
+                    page.get_by_role("button", name="Start a post").wait_for(
+                        state="visible", timeout=15000
+                    )
+                except PlaywrightTimeout:
+                    # Only NOW do we check the URL for login/checkpoint — after
+                    # giving the page a real chance to settle, not mid-redirect.
                     browser.close()
+                    if "login" in page.url or "checkpoint" in page.url:
+                        raise LinkedInPostError(
+                            "LinkedIn session appears expired (redirected to login/checkpoint). "
+                            "Re-run 'python -m poster.linkedin_poster --login' to refresh it."
+                        )
                     raise LinkedInPostError(
-                        "LinkedIn session appears expired (redirected to login/checkpoint). "
-                        "Re-run 'python -m poster.linkedin_poster --login' to refresh it."
+                        f"Could not find 'Start a post' button after loading the feed "
+                        f"(current URL: {page.url}). LinkedIn may have changed their page "
+                        f"layout, or the page loaded unusually slowly. Try again, or re-run "
+                        f"'python -m poster.linkedin_poster --login' if this persists."
                     )
 
                 # Open the post composer
