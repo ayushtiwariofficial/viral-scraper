@@ -140,19 +140,40 @@ def post_to_linkedin(text: str, max_retries: int = 2) -> str | None:
                         state="visible", timeout=15000
                     )
                 except PlaywrightTimeout:
-                    # Only NOW do we check the URL for login/checkpoint — after
-                    # giving the page a real chance to settle, not mid-redirect.
+                    # Capture a screenshot BEFORE closing the browser — this is
+                    # the single most useful piece of debugging info we're
+                    # missing right now. It tells us definitively whether
+                    # we're looking at a real login page, a LinkedIn security
+                    # checkpoint/CAPTCHA (common when automating from a
+                    # datacenter IP like GitHub Actions', even with valid
+                    # cookies), or something else entirely.
+                    screenshot_path = "logs/linkedin_failure.png"
+                    try:
+                        os.makedirs("logs", exist_ok=True)
+                        page.screenshot(path=screenshot_path, full_page=True)
+                        logger.warning(f"Saved failure screenshot to {screenshot_path}")
+                    except Exception as screenshot_error:
+                        logger.warning(f"Could not capture failure screenshot: {screenshot_error}")
+
+                    current_url = page.url
                     browser.close()
-                    if "login" in page.url or "checkpoint" in page.url:
+                    if "login" in current_url or "checkpoint" in current_url:
                         raise LinkedInPostError(
-                            "LinkedIn session appears expired (redirected to login/checkpoint). "
-                            "Re-run 'python -m poster.linkedin_poster --login' to refresh it."
+                            f"LinkedIn session appears expired or blocked (redirected to "
+                            f"{current_url}). This can mean the session genuinely expired, "
+                            f"OR that LinkedIn is showing a security checkpoint because it "
+                            f"doesn't recognize this IP/device — common when posting from "
+                            f"GitHub Actions' datacenter IPs even with valid cookies. Check "
+                            f"the uploaded screenshot artifact to see which. "
+                            f"Re-run 'python -m poster.linkedin_poster --login' if it's a "
+                            f"genuine expiry."
                         )
                     raise LinkedInPostError(
                         f"Could not find 'Start a post' button after loading the feed "
-                        f"(current URL: {page.url}). LinkedIn may have changed their page "
-                        f"layout, or the page loaded unusually slowly. Try again, or re-run "
-                        f"'python -m poster.linkedin_poster --login' if this persists."
+                        f"(current URL: {current_url}). LinkedIn may have changed their page "
+                        f"layout, or the page loaded unusually slowly. Check the screenshot "
+                        f"artifact, or re-run 'python -m poster.linkedin_poster --login' "
+                        f"if this persists."
                     )
 
                 # Open the post composer
@@ -287,9 +308,16 @@ def main():
     elif args.approve:
         result = approve_and_post(args.approve)
         print(result)
+        # Without this, the CLI always exits 0 even when posting genuinely
+        # fails — which is exactly why the GitHub Actions workflow showed a
+        # green checkmark on a run that never actually posted anything.
+        if not result.get("posted"):
+            sys.exit(1)
     elif args.reject:
         result = reject_post(args.reject)
         print(result)
+        if not result.get("rejected"):
+            sys.exit(1)
     else:
         parser.print_help()
 

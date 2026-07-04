@@ -101,11 +101,13 @@ jobs:
             python -m poster.linkedin_poster --reject "${{ inputs.content_id }}"
           fi
 
-      - name: Upload logs
+      - name: Upload logs and screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linkedin-approval-${{ github.run_number }}
-          path: logs/scraper.log
+          path: |
+            logs/scraper.log
+            logs/linkedin_failure.png
           if-no-files-found: ignore
           retention-days: 7
