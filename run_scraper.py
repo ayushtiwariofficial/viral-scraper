@@ -165,25 +165,13 @@ def show_stats() -> None:
     print(f"  In content queue    : {rewrites['total_in_content_queue']}")
     print(f"  Ready to post       : {rewrites['ready_to_post']}")
 
-    from data.database import get_db
-    with get_db() as conn:
-        pending_approval = conn.execute(
-            "SELECT COUNT(*) FROM content_queue WHERE approval_status='pending' AND posted_linkedin=0"
-        ).fetchone()[0]
-        posted_li = conn.execute(
-            "SELECT COUNT(*) FROM content_queue WHERE posted_linkedin=1"
-        ).fetchone()[0]
-        posted_tw = conn.execute(
-            "SELECT COUNT(*) FROM content_queue WHERE posted_twitter=1"
-        ).fetchone()[0]
-        rejected = conn.execute(
-            "SELECT COUNT(*) FROM content_queue WHERE approval_status='rejected'"
-        ).fetchone()[0]
+    from data.database import get_posting_status
+    posting = get_posting_status()
     print("\n── Posting status (Phase 4) ──────────────────")
-    print(f"  LinkedIn pending approval : {pending_approval}")
-    print(f"  LinkedIn posted           : {posted_li}")
-    print(f"  LinkedIn rejected         : {rejected}")
-    print(f"  Twitter posted (manual)   : {posted_tw}")
+    print(f"  LinkedIn pending approval : {posting['pending_approval']}")
+    print(f"  LinkedIn posted           : {posting['posted_linkedin']}")
+    print(f"  LinkedIn rejected         : {posting['rejected']}")
+    print(f"  Twitter posted (manual)   : {posting['posted_twitter']}")
 
     print("\n── Last 5 scraper runs ──────────────────────")
     for run in stats["recent_runs"]:
@@ -223,19 +211,9 @@ def main():
     init_db()
 
     if args.list:
-        from data.database import get_db
+        from data.database import get_all_content_queue
         import json as _json
-        with get_db() as conn:
-            rows = conn.execute(
-                """
-                SELECT cq.id, cq.approval_status, cq.posted_linkedin, cq.posted_twitter,
-                       cq.created_at, cq.linkedin_post, cq.twitter_thread, cq.hashtags,
-                       r.source, r.author
-                FROM content_queue cq
-                JOIN raw_posts r ON r.id = cq.raw_post_id
-                ORDER BY cq.id DESC
-                """
-            ).fetchall()
+        rows = get_all_content_queue()
         if not rows:
             print("Content queue is empty.")
             return
@@ -243,15 +221,15 @@ def main():
         print("-" * 100)
         for r in rows:
             try:
-                thread = _json.loads(r["twitter_thread"] or "[]")
-                preview = thread[0][:60] if thread else (r["linkedin_post"] or "")[:60]
+                thread = _json.loads(r.get("twitter_thread") or "[]")
+                preview = thread[0][:60] if thread else (r.get("linkedin_post") or "")[:60]
             except Exception:
-                preview = (r["linkedin_post"] or "")[:60]
-            source = f"{r['source']}/{r['author'] or '?'}"[:20]
-            created = (r["created_at"] or "")[:10]
-            li = "✓" if r["posted_linkedin"] else ("rej" if r["approval_status"] == "rejected" else "pend")
-            tw = "✓" if r["posted_twitter"] else "-"
-            print(f"{r['id']:<5} {source:<20} {r['approval_status']:<10} {li:<5} {tw:<5} {created:<12}  {preview}...")
+                preview = (r.get("linkedin_post") or "")[:60]
+            source = f"{r.get('source','?')}/{r.get('author') or '?'}"[:20]
+            created = (r.get("created_at") or "")[:10]
+            li = "✓" if r.get("posted_linkedin") else ("rej" if r.get("approval_status") == "rejected" else "pend")
+            tw = "✓" if r.get("posted_twitter") else "-"
+            print(f"{r.get('id'):<5} {source:<20} {r.get('approval_status','?'):<10} {li:<5} {tw:<5} {created:<12}  {preview}...")
         print(f"\nTotal: {len(rows)} posts  |  Run: python run_scraper.py --preview <ID>  to see full content")
         print()
         return

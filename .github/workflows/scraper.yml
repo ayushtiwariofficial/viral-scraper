@@ -17,8 +17,6 @@ jobs:
     name: Run scrapers
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    permissions:
-      actions: write   # write needed to download artifact zip files via the API
 
     steps:
       - name: Checkout repository
@@ -39,19 +37,11 @@ jobs:
           touch config/__init__.py data/__init__.py scrapers/__init__.py
           touch ai/__init__.py poster/__init__.py logs/scraper.log
 
-      # Download latest DB artifact via the GitHub API.
-      # actions/download-artifact@v4 only sees artifacts from the
-      # CURRENT run — it can't find artifacts from previous runs.
-      # Our Python script uses the REST API to find the latest
-      # 'viral-scraper-db' artifact across ALL runs.
-      - name: Restore database
+      # No more DB restore step needed — Supabase is always-on.
+      - name: Verify Supabase connection
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python .github/scripts/download_db.py || echo "No previous DB found (first run) — starting fresh"
-          ls -lh data/ 2>/dev/null || echo "data/ is empty"
-
-      - name: Verify project structure
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           python -c "
           import sys; sys.path.insert(0, '.')
@@ -61,7 +51,8 @@ jobs:
           from ai.rewriter import rewrite_posts
           from poster.notifier import notify_ready_content
           init_db()
-          print('✓ All imports OK')
+          print('✓ All imports OK, Supabase connected')
+          print(f'✓ {len(KEYWORDS)} keywords, {len(TWITTER_ACCOUNTS)} Twitter accounts')
           "
 
       - name: Run scraper
@@ -70,6 +61,8 @@ jobs:
           GROQ_API_KEY:   ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NTFY_TOPIC:     ${{ secrets.NTFY_TOPIC }}
+          SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
         run: |
           SOURCE="${{ github.event.inputs.source }}"
           if [ -n "$SOURCE" ]; then
@@ -79,19 +72,10 @@ jobs:
           fi
 
       - name: Show collection stats
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python run_scraper.py --stats
-
-      # Upload updated DB — overwrite:true replaces the previous version
-      # so the approval workflow always gets the latest data
-      - name: Save database artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: viral-scraper-db
-          path: data/posts.db
-          overwrite: true
-          if-no-files-found: ignore
-          retention-days: 90
 
       - name: Upload logs
         if: always()

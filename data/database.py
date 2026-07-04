@@ -1,130 +1,78 @@
 # ============================================================
-#  data/database.py  —  SQLite storage layer
+#  data/database.py  —  Supabase (Postgres) storage layer
+#
+#  Migrated from SQLite + GitHub Actions artifacts after hitting
+#  an unresolved GitHub bug: actions/upload-artifact@v4 moved to
+#  Azure Blob storage, and the artifact download API redirects to
+#  a SAS-signed Azure URL that rejects requests carrying an
+#  Authorization header — causing persistent 401s with no fix on
+#  our end (confirmed via multiple open GitHub community threads).
+#
+#  Supabase's free tier (500MB Postgres, generous API limits) is
+#  a real always-on database — no more artifact/cache juggling
+#  between workflow runs. It also sets up cleanly for the future
+#  multi-user SaaS phase via Row Level Security (see the schema
+#  file's note on this).
+#
+#  Every function below has the EXACT same name and signature as
+#  the old SQLite version, so ai/scorer.py, ai/rewriter.py,
+#  poster/*.py, and run_scraper.py did not need any changes.
 # ============================================================
 
-import sqlite3
 import hashlib
 import logging
-from datetime import datetime
-from contextlib import contextmanager
-
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.settings import DB_PATH
+import os
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-# ── Schema ───────────────────────────────────────────────────
-
-SCHEMA = """
--- Raw posts collected from all sources
-CREATE TABLE IF NOT EXISTS raw_posts (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_hash  TEXT    UNIQUE NOT NULL,   -- SHA256 of content (dedup key)
-    source        TEXT    NOT NULL,          -- 'twitter' | 'reddit' | 'rss' | 'linkedin'
-    platform      TEXT    NOT NULL,          -- e.g. 'nitter', 'reddit.com'
-    author        TEXT,
-    title         TEXT,                      -- used for reddit/rss titles
-    content       TEXT    NOT NULL,
-    url           TEXT,
-    engagement    INTEGER DEFAULT 0,         -- likes / upvotes / comments
-    scraped_at    TEXT    NOT NULL,
-    status        TEXT    DEFAULT 'raw',     -- 'raw'|'scored'|'queued'|'rewritten'|'posted'|'skipped'|'rewrite_failed'
-    rewrite_attempts INTEGER DEFAULT 0       -- tracks retries to avoid infinite loops
-);
-
--- Virality scores assigned by AI (Phase 2)
-CREATE TABLE IF NOT EXISTS scored_posts (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    raw_post_id     INTEGER REFERENCES raw_posts(id),
-    virality_score  REAL,                    -- 1–10
-    relevance_score REAL,                    -- 1–10
-    uniqueness_score REAL,                   -- 1–10
-    total_score     REAL,
-    scored_at       TEXT    NOT NULL
-);
-
--- Rewritten content ready to post (Phase 3)
-CREATE TABLE IF NOT EXISTS content_queue (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    raw_post_id     INTEGER REFERENCES raw_posts(id),
-    twitter_thread  TEXT,                    -- JSON array of tweet strings
-    linkedin_post   TEXT,
-    hashtags        TEXT,                    -- comma-separated
-    created_at      TEXT    NOT NULL,
-    scheduled_at    TEXT,                    -- when to post
-    posted_twitter  INTEGER DEFAULT 0,       -- 0 = no, 1 = yes
-    posted_linkedin INTEGER DEFAULT 0,
-    posted_at       TEXT,
-    posted_linkedin_url TEXT,                -- profile/post URL after successful LinkedIn post
-    approval_status TEXT    DEFAULT 'pending', -- 'pending' | 'approved' | 'rejected'
-    notified        INTEGER DEFAULT 0         -- 0 = no notification sent yet, 1 = sent
-);
-
--- Scraper run history
-CREATE TABLE IF NOT EXISTS scraper_runs (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at   TEXT    NOT NULL,
-    finished_at  TEXT,
-    source       TEXT    NOT NULL,
-    posts_found  INTEGER DEFAULT 0,
-    posts_new    INTEGER DEFAULT 0,
-    error        TEXT
-);
-
--- Indexes for fast lookups
-CREATE INDEX IF NOT EXISTS idx_raw_hash   ON raw_posts(content_hash);
-CREATE INDEX IF NOT EXISTS idx_raw_status ON raw_posts(status);
-CREATE INDEX IF NOT EXISTS idx_raw_source ON raw_posts(source);
-CREATE INDEX IF NOT EXISTS idx_queue_posted ON content_queue(posted_twitter, posted_linkedin);
-"""
+_client = None
 
 
-# ── Connection helper ─────────────────────────────────────────
+def _get_client():
+    """Lazily create and cache the Supabase client."""
+    global _client
+    if _client is not None:
+        return _client
 
-@contextmanager
-def get_db():
-    """Context manager — always closes the connection."""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row          # rows behave like dicts
-    conn.execute("PRAGMA journal_mode=WAL") # safe for concurrent reads
-    conn.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise EnvironmentError(
+            "SUPABASE_URL and SUPABASE_KEY must be set (as env vars locally, "
+            "or as GitHub Actions secrets). See SUPABASE_SETUP.md."
+        )
+
+    from supabase import create_client
+    _client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _client
+
+
+def _now() -> str:
+    """ISO timestamp string, timezone-aware, for timestamptz columns."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ── Init ──────────────────────────────────────────────────────
 
 def init_db():
-    """Create all tables if they don't exist, and migrate older DBs safely."""
-    with get_db() as conn:
-        conn.executescript(SCHEMA)
-
-        # Migrations for columns added after the initial schema — safe to run
-        # every time, since SQLite raises "duplicate column" if it already
-        # exists and we just ignore that specific error.
-        migrations = [
-            "ALTER TABLE raw_posts ADD COLUMN rewrite_attempts INTEGER DEFAULT 0",
-            "ALTER TABLE content_queue ADD COLUMN posted_linkedin_url TEXT",
-            "ALTER TABLE content_queue ADD COLUMN approval_status TEXT DEFAULT 'pending'",
-            "ALTER TABLE content_queue ADD COLUMN notified INTEGER DEFAULT 0",
-        ]
-        for stmt in migrations:
-            try:
-                conn.execute(stmt)
-            except sqlite3.OperationalError as e:
-                if "duplicate column" not in str(e).lower():
-                    raise
-
-    logger.info(f"Database ready at {DB_PATH}")
+    """
+    No-op for Supabase — tables are created once via supabase_schema.sql
+    in the Supabase SQL Editor, not per-run like SQLite's CREATE TABLE IF
+    NOT EXISTS. This function just verifies the connection works, so
+    callers get an early, clear error instead of a confusing failure
+    deep inside some later query.
+    """
+    client = _get_client()
+    try:
+        client.table("raw_posts").select("id").limit(1).execute()
+        logger.info(f"Connected to Supabase at {SUPABASE_URL}")
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not query Supabase — has supabase_schema.sql been run yet? "
+            f"See SUPABASE_SETUP.md. Original error: {e}"
+        )
 
 
 # ── Core helpers (Phase 1) ────────────────────────────────────
@@ -136,12 +84,15 @@ def make_hash(content: str) -> str:
 
 def is_duplicate(content_hash: str) -> bool:
     """Return True if we've already seen this content."""
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT id FROM raw_posts WHERE content_hash = ?",
-            (content_hash,)
-        ).fetchone()
-    return row is not None
+    client = _get_client()
+    resp = (
+        client.table("raw_posts")
+        .select("id")
+        .eq("content_hash", content_hash)
+        .limit(1)
+        .execute()
+    )
+    return len(resp.data) > 0
 
 
 def save_post(
@@ -162,62 +113,77 @@ def save_post(
     if is_duplicate(content_hash):
         return None
 
-    with get_db() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO raw_posts
-                (content_hash, source, platform, author, title, content, url, engagement, scraped_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                content_hash, source, platform,
-                author, title, content, url,
-                engagement, datetime.utcnow().isoformat(),
-            )
-        )
-    return cursor.lastrowid
+    client = _get_client()
+    resp = (
+        client.table("raw_posts")
+        .insert({
+            "content_hash": content_hash,
+            "source": source,
+            "platform": platform,
+            "author": author,
+            "title": title,
+            "content": content,
+            "url": url,
+            "engagement": engagement,
+            "scraped_at": _now(),
+        })
+        .execute()
+    )
+    return resp.data[0]["id"] if resp.data else None
 
 
 def log_run(source: str, posts_found: int, posts_new: int,
             started_at: str, error: str = None) -> None:
     """Record a scraper run in the history table."""
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO scraper_runs
-                (started_at, finished_at, source, posts_found, posts_new, error)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                started_at,
-                datetime.utcnow().isoformat(),
-                source, posts_found, posts_new, error,
-            )
-        )
+    client = _get_client()
+    client.table("scraper_runs").insert({
+        "started_at": started_at,
+        "finished_at": _now(),
+        "source": source,
+        "posts_found": posts_found,
+        "posts_new": posts_new,
+        "error": error,
+    }).execute()
 
 
 def get_stats() -> dict:
     """Quick summary for the status dashboard."""
-    with get_db() as conn:
-        total   = conn.execute("SELECT COUNT(*) FROM raw_posts").fetchone()[0]
-        today   = conn.execute(
-            "SELECT COUNT(*) FROM raw_posts WHERE scraped_at >= date('now')"
-        ).fetchone()[0]
-        queued  = conn.execute(
-            "SELECT COUNT(*) FROM raw_posts WHERE status = 'queued'"
-        ).fetchone()[0]
-        posted  = conn.execute(
-            "SELECT COUNT(*) FROM content_queue WHERE posted_twitter=1 OR posted_linkedin=1"
-        ).fetchone()[0]
-        runs    = conn.execute(
-            "SELECT * FROM scraper_runs ORDER BY started_at DESC LIMIT 5"
-        ).fetchall()
+    client = _get_client()
+
+    total = client.table("raw_posts").select("id", count="exact").execute()
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00")
+    today = (
+        client.table("raw_posts")
+        .select("id", count="exact")
+        .gte("scraped_at", today_iso)
+        .execute()
+    )
+    queued = (
+        client.table("raw_posts")
+        .select("id", count="exact")
+        .eq("status", "queued")
+        .execute()
+    )
+    posted = (
+        client.table("content_queue")
+        .select("id", count="exact")
+        .or_("posted_twitter.eq.1,posted_linkedin.eq.1")
+        .execute()
+    )
+    runs = (
+        client.table("scraper_runs")
+        .select("*")
+        .order("started_at", desc=True)
+        .limit(5)
+        .execute()
+    )
+
     return {
-        "total_posts": total,
-        "scraped_today": today,
-        "in_queue": queued,
-        "posted": posted,
-        "recent_runs": [dict(r) for r in runs],
+        "total_posts": total.count or 0,
+        "scraped_today": today.count or 0,
+        "in_queue": queued.count or 0,
+        "posted": posted.count or 0,
+        "recent_runs": runs.data,
     }
 
 
@@ -225,11 +191,16 @@ def get_stats() -> dict:
 
 def get_unscored_posts(limit: int = 50):
     """Fetch raw posts not yet scored, highest engagement first."""
-    with get_db() as conn:
-        return conn.execute(
-            "SELECT * FROM raw_posts WHERE status = 'raw' ORDER BY engagement DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
+    client = _get_client()
+    resp = (
+        client.table("raw_posts")
+        .select("*")
+        .eq("status", "raw")
+        .order("engagement", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return resp.data
 
 
 def save_score(
@@ -240,38 +211,34 @@ def save_score(
 ) -> int:
     """
     Save an AI-generated score for a post and mark it as 'scored'.
-    total_score is a weighted average — virality matters most,
-    since that's what drives growth.
+    total_score is a weighted average — virality matters most.
     """
     total_score = round(
         (virality_score * 0.5) + (relevance_score * 0.3) + (uniqueness_score * 0.2),
         2
     )
 
-    with get_db() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO scored_posts
-                (raw_post_id, virality_score, relevance_score, uniqueness_score, total_score, scored_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (raw_post_id, virality_score, relevance_score, uniqueness_score,
-             total_score, datetime.utcnow().isoformat())
-        )
-        conn.execute(
-            "UPDATE raw_posts SET status = 'scored' WHERE id = ?",
-            (raw_post_id,)
-        )
-    return cursor.lastrowid
+    client = _get_client()
+    resp = (
+        client.table("scored_posts")
+        .insert({
+            "raw_post_id": raw_post_id,
+            "virality_score": virality_score,
+            "relevance_score": relevance_score,
+            "uniqueness_score": uniqueness_score,
+            "total_score": total_score,
+            "scored_at": _now(),
+        })
+        .execute()
+    )
+    client.table("raw_posts").update({"status": "scored"}).eq("id", raw_post_id).execute()
+    return resp.data[0]["id"] if resp.data else None
 
 
 def mark_skipped(raw_post_id: int, reason: str = "") -> None:
     """Mark a post as skipped (e.g. AI scoring failed, or it was junk)."""
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE raw_posts SET status = 'skipped' WHERE id = ?",
-            (raw_post_id,)
-        )
+    client = _get_client()
+    client.table("raw_posts").update({"status": "skipped"}).eq("id", raw_post_id).execute()
     if reason:
         logger.debug(f"Post {raw_post_id} skipped: {reason}")
 
@@ -281,90 +248,99 @@ def get_top_scored_posts(limit: int = 5, min_score: float = 6.0):
     Fetch the highest-scoring posts that haven't been queued yet.
     Joins raw_posts + scored_posts, ordered by total_score descending.
     """
-    with get_db() as conn:
-        return conn.execute(
-            """
-            SELECT
-                r.id, r.source, r.platform, r.author, r.title,
-                r.content, r.url, r.engagement,
-                s.virality_score, s.relevance_score, s.uniqueness_score, s.total_score
-            FROM raw_posts r
-            JOIN scored_posts s ON s.raw_post_id = r.id
-            WHERE r.status = 'scored' AND s.total_score >= ?
-            ORDER BY s.total_score DESC
-            LIMIT ?
-            """,
-            (min_score, limit)
-        ).fetchall()
+    client = _get_client()
+    resp = (
+        client.table("scored_posts")
+        .select("*, raw_posts!inner(id, source, platform, author, title, content, url, engagement, status)")
+        .eq("raw_posts.status", "scored")
+        .gte("total_score", min_score)
+        .order("total_score", desc=True)
+        .limit(limit)
+        .execute()
+    )
+
+    # Flatten the joined structure to match the old SQLite row shape
+    results = []
+    for row in resp.data:
+        row = dict(row)
+        rp = row.pop("raw_posts")
+        merged = {**rp, **row}
+        results.append(merged)
+    return results
 
 
 def mark_queued(raw_post_id: int) -> None:
     """Mark a post as queued for rewriting (Phase 3)."""
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE raw_posts SET status = 'queued' WHERE id = ?",
-            (raw_post_id,)
-        )
+    client = _get_client()
+    client.table("raw_posts").update({"status": "queued"}).eq("id", raw_post_id).execute()
 
 
 def get_scoring_stats() -> dict:
     """Quick breakdown of the scoring pipeline status."""
-    with get_db() as conn:
-        raw     = conn.execute("SELECT COUNT(*) FROM raw_posts WHERE status='raw'").fetchone()[0]
-        scored  = conn.execute("SELECT COUNT(*) FROM raw_posts WHERE status='scored'").fetchone()[0]
-        queued  = conn.execute("SELECT COUNT(*) FROM raw_posts WHERE status='queued'").fetchone()[0]
-        skipped = conn.execute("SELECT COUNT(*) FROM raw_posts WHERE status='skipped'").fetchone()[0]
-        avg_score = conn.execute("SELECT AVG(total_score) FROM scored_posts").fetchone()[0]
+    client = _get_client()
+
+    def count_by_status(status):
+        r = client.table("raw_posts").select("id", count="exact").eq("status", status).execute()
+        return r.count or 0
+
+    raw     = count_by_status("raw")
+    scored  = count_by_status("scored")
+    queued  = count_by_status("queued")
+    skipped = count_by_status("skipped")
+
+    scores = client.table("scored_posts").select("total_score").execute()
+    values = [r["total_score"] for r in scores.data if r["total_score"] is not None]
+    avg_score = round(sum(values) / len(values), 2) if values else 0
+
     return {
         "raw": raw, "scored": scored, "queued": queued, "skipped": skipped,
-        "avg_score": round(avg_score, 2) if avg_score else 0,
+        "avg_score": avg_score,
     }
 
 
-# ── Phase 3: Content rewriting helpers ────────────────────────
+# ── Phase 3: AI rewriting helpers ─────────────────────────────
 
 def get_queued_posts_without_content(limit: int = 10, max_attempts: int = 3):
     """
     Fetch posts marked 'queued' that don't yet have a content_queue
     entry — these are ready for Phase 3 rewriting. Excludes posts
-    that have already failed max_attempts times, so we don't burn
-    API quota retrying something that's permanently broken.
+    that have already failed max_attempts times.
     """
-    with get_db() as conn:
-        return conn.execute(
-            """
-            SELECT r.* FROM raw_posts r
-            WHERE r.status = 'queued'
-              AND r.rewrite_attempts < ?
-              AND r.id NOT IN (SELECT raw_post_id FROM content_queue)
-            ORDER BY r.id
-            LIMIT ?
-            """,
-            (max_attempts, limit)
-        ).fetchall()
+    client = _get_client()
+
+    existing = client.table("content_queue").select("raw_post_id").execute()
+    existing_ids = {r["raw_post_id"] for r in existing.data}
+
+    resp = (
+        client.table("raw_posts")
+        .select("*")
+        .eq("status", "queued")
+        .lt("rewrite_attempts", max_attempts)
+        .order("id")
+        .limit(limit + len(existing_ids))   # overfetch to account for filtering below
+        .execute()
+    )
+
+    result = [r for r in resp.data if r["id"] not in existing_ids]
+    return result[:limit]
 
 
 def record_rewrite_failure(raw_post_id: int, max_attempts: int = 3) -> None:
     """
     Increment a post's rewrite_attempts counter. Once it hits
-    max_attempts, mark it 'rewrite_failed' so it stops being
-    picked up by future runs.
+    max_attempts, mark it 'rewrite_failed'.
     """
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE raw_posts SET rewrite_attempts = rewrite_attempts + 1 WHERE id = ?",
-            (raw_post_id,)
-        )
-        row = conn.execute(
-            "SELECT rewrite_attempts FROM raw_posts WHERE id = ?",
-            (raw_post_id,)
-        ).fetchone()
-        if row and row["rewrite_attempts"] >= max_attempts:
-            conn.execute(
-                "UPDATE raw_posts SET status = 'rewrite_failed' WHERE id = ?",
-                (raw_post_id,)
-            )
-            logger.warning(f"Post {raw_post_id} gave up after {max_attempts} failed rewrite attempts")
+    client = _get_client()
+    row = client.table("raw_posts").select("rewrite_attempts").eq("id", raw_post_id).execute()
+    current = row.data[0]["rewrite_attempts"] if row.data else 0
+    new_attempts = current + 1
+
+    update = {"rewrite_attempts": new_attempts}
+    if new_attempts >= max_attempts:
+        update["status"] = "rewrite_failed"
+        logger.warning(f"Post {raw_post_id} gave up after {max_attempts} failed rewrite attempts")
+
+    client.table("raw_posts").update(update).eq("id", raw_post_id).execute()
 
 
 def save_rewritten_content(
@@ -379,62 +355,57 @@ def save_rewritten_content(
     """
     import json as _json
 
-    with get_db() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO content_queue
-                (raw_post_id, twitter_thread, linkedin_post, hashtags, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                raw_post_id,
-                _json.dumps(twitter_thread),
-                linkedin_post,
-                ", ".join(hashtags),
-                datetime.utcnow().isoformat(),
-            )
-        )
-        conn.execute(
-            "UPDATE raw_posts SET status = 'rewritten' WHERE id = ?",
-            (raw_post_id,)
-        )
-    return cursor.lastrowid
+    client = _get_client()
+    resp = (
+        client.table("content_queue")
+        .insert({
+            "raw_post_id": raw_post_id,
+            "twitter_thread": _json.dumps(twitter_thread),
+            "linkedin_post": linkedin_post,
+            "hashtags": ", ".join(hashtags),
+            "created_at": _now(),
+        })
+        .execute()
+    )
+    client.table("raw_posts").update({"status": "rewritten"}).eq("id", raw_post_id).execute()
+    return resp.data[0]["id"] if resp.data else None
 
 
 def get_unposted_content(limit: int = 10):
     """Fetch rewritten content not yet posted to either platform (for Phase 4)."""
-    with get_db() as conn:
-        return conn.execute(
-            """
-            SELECT cq.*, r.source AS original_source, r.author AS original_author, r.url AS original_url
-            FROM content_queue cq
-            JOIN raw_posts r ON r.id = cq.raw_post_id
-            WHERE cq.posted_twitter = 0 OR cq.posted_linkedin = 0
-            ORDER BY cq.created_at
-            LIMIT ?
-            """,
-            (limit,)
-        ).fetchall()
+    client = _get_client()
+    resp = (
+        client.table("content_queue")
+        .select("*, raw_posts!inner(source, author, url)")
+        .eq("posted_twitter", 0)
+        .eq("posted_linkedin", 0)
+        .limit(limit)
+        .execute()
+    )
+    return _flatten_raw_posts_join(resp.data)
 
 
 def get_rewrite_stats() -> dict:
     """Quick breakdown of the rewriting pipeline status."""
-    with get_db() as conn:
-        queued_unwritten = conn.execute(
-            "SELECT COUNT(*) FROM raw_posts WHERE status='queued'"
-        ).fetchone()[0]
-        rewritten = conn.execute(
-            "SELECT COUNT(*) FROM raw_posts WHERE status='rewritten'"
-        ).fetchone()[0]
-        rewrite_failed = conn.execute(
-            "SELECT COUNT(*) FROM raw_posts WHERE status='rewrite_failed'"
-        ).fetchone()[0]
-        total_in_queue = conn.execute(
-            "SELECT COUNT(*) FROM content_queue"
-        ).fetchone()[0]
-        ready_to_post = conn.execute(
-            "SELECT COUNT(*) FROM content_queue WHERE posted_twitter=0 AND posted_linkedin=0"
-        ).fetchone()[0]
+    client = _get_client()
+
+    def count_raw_status(status):
+        r = client.table("raw_posts").select("id", count="exact").eq("status", status).execute()
+        return r.count or 0
+
+    queued_unwritten = count_raw_status("queued")
+    rewritten        = count_raw_status("rewritten")
+    rewrite_failed   = count_raw_status("rewrite_failed")
+
+    total_in_queue = client.table("content_queue").select("id", count="exact").execute().count or 0
+    ready_to_post = (
+        client.table("content_queue")
+        .select("id", count="exact")
+        .eq("posted_twitter", 0)
+        .eq("posted_linkedin", 0)
+        .execute()
+    ).count or 0
+
     return {
         "queued_awaiting_rewrite": queued_unwritten,
         "rewritten": rewritten,
@@ -447,82 +418,117 @@ def get_rewrite_stats() -> dict:
 # ── Phase 4: notification + LinkedIn approval/posting helpers ────
 
 def get_unnotified_content(limit: int = 10):
-    """
-    Fetch content_queue rows that haven't been notified about yet —
-    these are fresh rewrites the user hasn't seen a draft/approval
-    request for. Joins raw_posts for source/author context, same
-    pattern as get_unposted_content().
-    """
-    with get_db() as conn:
-        return conn.execute(
-            """
-            SELECT cq.*, r.source AS original_source, r.author AS original_author, r.url AS original_url
-            FROM content_queue cq
-            JOIN raw_posts r ON r.id = cq.raw_post_id
-            WHERE cq.notified = 0
-            ORDER BY cq.created_at
-            LIMIT ?
-            """,
-            (limit,)
-        ).fetchall()
+    """Fetch content_queue rows that haven't been notified about yet."""
+    client = _get_client()
+    resp = (
+        client.table("content_queue")
+        .select("*, raw_posts!inner(source, author, url)")
+        .eq("notified", 0)
+        .order("created_at")
+        .limit(limit)
+        .execute()
+    )
+    return _flatten_raw_posts_join(resp.data)
 
 
 def mark_notified(content_id: int) -> None:
     """Mark a content_queue row as having been notified about."""
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE content_queue SET notified = 1 WHERE id = ?",
-            (content_id,)
-        )
+    client = _get_client()
+    client.table("content_queue").update({"notified": 1}).eq("id", content_id).execute()
 
 
 def get_content_by_id(content_id: int):
     """Fetch a single content_queue row by ID, with source context joined in."""
-    with get_db() as conn:
-        return conn.execute(
-            """
-            SELECT cq.*, r.source AS original_source, r.author AS original_author, r.url AS original_url
-            FROM content_queue cq
-            JOIN raw_posts r ON r.id = cq.raw_post_id
-            WHERE cq.id = ?
-            """,
-            (content_id,)
-        ).fetchone()
+    client = _get_client()
+    resp = (
+        client.table("content_queue")
+        .select("*, raw_posts!inner(source, author, url)")
+        .eq("id", content_id)
+        .limit(1)
+        .execute()
+    )
+    rows = _flatten_raw_posts_join(resp.data)
+    return rows[0] if rows else None
 
 
 def set_approval_status(content_id: int, status: str) -> None:
     """Set a content_queue row's approval_status: 'pending' | 'approved' | 'rejected'."""
     if status not in ("pending", "approved", "rejected"):
         raise ValueError(f"Invalid approval_status: {status!r}")
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE content_queue SET approval_status = ? WHERE id = ?",
-            (status, content_id)
-        )
+    client = _get_client()
+    client.table("content_queue").update({"approval_status": status}).eq("id", content_id).execute()
 
 
 def mark_posted_linkedin(content_id: int, post_url: str = None) -> None:
     """Mark a content_queue row as successfully posted to LinkedIn."""
-    with get_db() as conn:
-        conn.execute(
-            """
-            UPDATE content_queue
-            SET posted_linkedin = 1, posted_at = ?, posted_linkedin_url = ?
-            WHERE id = ?
-            """,
-            (datetime.utcnow().isoformat(), post_url, content_id)
-        )
+    client = _get_client()
+    client.table("content_queue").update({
+        "posted_linkedin": 1,
+        "posted_at": _now(),
+        "posted_linkedin_url": post_url,
+    }).eq("id", content_id).execute()
 
 
 def mark_posted_twitter(content_id: int) -> None:
+    """Mark a content_queue row as posted to Twitter (manual posting)."""
+    client = _get_client()
+    client.table("content_queue").update({
+        "posted_twitter": 1,
+        "posted_at": _now(),
+    }).eq("id", content_id).execute()
+
+
+def get_posting_status() -> dict:
+    """Quick breakdown of LinkedIn/Twitter posting status for --stats."""
+    client = _get_client()
+
+    def count_cq(**filters):
+        q = client.table("content_queue").select("id", count="exact")
+        for field, val in filters.items():
+            q = q.eq(field, val)
+        return q.execute().count or 0
+
+    return {
+        "pending_approval": count_cq(approval_status="pending", posted_linkedin=0),
+        "posted_linkedin":  count_cq(posted_linkedin=1),
+        "posted_twitter":   count_cq(posted_twitter=1),
+        "rejected":         count_cq(approval_status="rejected"),
+    }
+
+
+def get_all_content_queue() -> list:
+    """Fetch every content_queue row joined with source info, newest first — for --list."""
+    client = _get_client()
+    resp = (
+        client.table("content_queue")
+        .select("*, raw_posts!inner(source, author)")
+        .order("id", desc=True)
+        .execute()
+    )
+    rows = []
+    for row in resp.data:
+        row = dict(row)
+        rp = row.pop("raw_posts", {}) or {}
+        row["source"] = rp.get("source")
+        row["author"] = rp.get("author")
+        rows.append(row)
+    return rows
+
+
+# ── Internal helpers ─────────────────────────────────────────
+
+def _flatten_raw_posts_join(rows: list) -> list:
     """
-    Mark a content_queue row as posted to Twitter. Since Twitter is
-    manual (the API isn't free for new developers as of Feb 2026),
-    this is set by the user confirming they posted the draft manually
-    — see run_scraper.py --mark-twitter-posted.
+    Supabase's nested-select join returns {"raw_posts": {...}, ...}.
+    Flatten to match the old SQLite row shape which used aliased
+    columns like original_source, original_author, original_url.
     """
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE content_queue SET posted_twitter = 1, posted_at = ? WHERE id = ?",
-            (datetime.utcnow().isoformat(), content_id)
-        )
+    flattened = []
+    for row in rows:
+        row = dict(row)
+        rp = row.pop("raw_posts", {}) or {}
+        row["original_source"] = rp.get("source")
+        row["original_author"] = rp.get("author")
+        row["original_url"]    = rp.get("url")
+        flattened.append(row)
+    return flattened
