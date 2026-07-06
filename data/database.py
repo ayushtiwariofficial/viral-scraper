@@ -515,6 +515,46 @@ def get_all_content_queue() -> list:
     return rows
 
 
+# ── LinkedIn OAuth token storage (Posts API — replaces Playwright) ────
+
+def save_linkedin_tokens(
+    access_token: str,
+    refresh_token: str,
+    access_token_expires_at: str,
+    refresh_token_expires_at: str,
+    person_urn: str,
+) -> None:
+    """
+    Save (or overwrite) the LinkedIn OAuth tokens. Single-row table for
+    the MVP — always replaces row id=1. When this becomes multi-user,
+    this will need a user_id and become an upsert keyed on that instead.
+    """
+    client = _get_client()
+    existing = client.table("linkedin_oauth_tokens").select("id").execute()
+
+    payload = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "access_token_expires_at": access_token_expires_at,
+        "refresh_token_expires_at": refresh_token_expires_at,
+        "person_urn": person_urn,
+        "updated_at": _now(),
+    }
+
+    if existing.data:
+        client.table("linkedin_oauth_tokens").update(payload).eq("id", existing.data[0]["id"]).execute()
+    else:
+        payload["created_at"] = _now()
+        client.table("linkedin_oauth_tokens").insert(payload).execute()
+
+
+def get_linkedin_tokens() -> dict | None:
+    """Fetch the stored LinkedIn OAuth tokens, or None if never connected."""
+    client = _get_client()
+    resp = client.table("linkedin_oauth_tokens").select("*").limit(1).execute()
+    return resp.data[0] if resp.data else None
+
+
 # ── Internal helpers ─────────────────────────────────────────
 
 def _flatten_raw_posts_join(rows: list) -> list:

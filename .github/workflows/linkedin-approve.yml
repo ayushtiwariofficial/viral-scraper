@@ -17,7 +17,7 @@ jobs:
   approve-and-post:
     name: Process LinkedIn approval
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5   # just an API call now — no browser to install/launch
 
     steps:
       - name: Checkout repository
@@ -29,10 +29,10 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      # No more playwright install — we post via LinkedIn's official
+      # API now, just an HTTPS request. Much faster, much simpler.
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+        run: pip install -r requirements.txt
 
       - name: Create required directories
         run: |
@@ -40,60 +40,12 @@ jobs:
           touch config/__init__.py data/__init__.py scrapers/__init__.py
           touch ai/__init__.py poster/__init__.py logs/scraper.log
 
-      - name: Verify post exists in database
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: |
-          python -c "
-          import sys
-          sys.path.insert(0, '.')
-          from data.database import init_db, get_content_by_id
-          init_db()
-          row = get_content_by_id(${{ inputs.content_id }})
-          if not row:
-              print('ERROR: Post #${{ inputs.content_id }} not found.')
-              print('Run the main scraper workflow first, then check ntfy or --list for valid IDs.')
-              sys.exit(1)
-          print(f'Post #{row[\"id\"]} | {row.get(\"original_source\",\"?\")} / {row.get(\"original_author\",\"?\")}')
-          print(f'Approval: {row.get(\"approval_status\",\"?\")} | LinkedIn posted: {bool(row.get(\"posted_linkedin\"))}')
-          if row.get('approval_status') == 'rejected':
-              print('ERROR: This post was previously rejected.')
-              sys.exit(1)
-          if row.get('posted_linkedin'):
-              print('ERROR: This post was already posted to LinkedIn.')
-              sys.exit(1)
-          print('✓ Post is valid and ready for approval')
-          "
-
-      - name: Restore LinkedIn session
-        env:
-          LINKEDIN_SESSION_B64: ${{ secrets.LINKEDIN_SESSION_B64 }}
-        run: |
-          python3 -c "
-          import base64, os, sys, json
-          raw = os.environ.get('LINKEDIN_SESSION_B64', '')
-          if not raw:
-              print('ERROR: LINKEDIN_SESSION_B64 not set.', file=sys.stderr)
-              print('Run: python -m poster.linkedin_poster --login', file=sys.stderr)
-              sys.exit(1)
-          try:
-              decoded = base64.b64decode(raw, validate=False)
-              parsed  = json.loads(decoded)
-          except Exception as e:
-              print(f'ERROR: Bad session data: {e}', file=sys.stderr)
-              print('Re-run: python -m poster.linkedin_poster --login', file=sys.stderr)
-              sys.exit(1)
-          os.makedirs('data', exist_ok=True)
-          with open('data/linkedin_session.json', 'wb') as f:
-              f.write(decoded)
-          print(f'✓ Session restored ({len(parsed.get(\"cookies\",[]))} cookies)')
-          "
-
       - name: Process approval
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_URL:           ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:           ${{ secrets.SUPABASE_KEY }}
+          LINKEDIN_CLIENT_ID:     ${{ secrets.LINKEDIN_CLIENT_ID }}
+          LINKEDIN_CLIENT_SECRET: ${{ secrets.LINKEDIN_CLIENT_SECRET }}
         run: |
           if [ "${{ inputs.action }}" = "approve" ]; then
             python -m poster.linkedin_poster --approve "${{ inputs.content_id }}"
@@ -101,13 +53,11 @@ jobs:
             python -m poster.linkedin_poster --reject "${{ inputs.content_id }}"
           fi
 
-      - name: Upload logs and screenshot
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linkedin-approval-${{ github.run_number }}
-          path: |
-            logs/scraper.log
-            logs/linkedin_failure.png
+          path: logs/scraper.log
           if-no-files-found: ignore
           retention-days: 7
