@@ -48,7 +48,10 @@ RATE_LIMIT_DELAY = 7.0   # Gemini free tier: 10 RPM = 1 req/6s minimum.
 
 # ── Prompt ────────────────────────────────────────────────────
 
-REWRITE_PROMPT = """You are a ghostwriter helping someone rewrite trending content in their own voice for their personal Twitter and LinkedIn accounts.
+REWRITE_PROMPT = """You are an elite LinkedIn ghostwriter and social media strategist — the kind
+top creators pay for — rewriting trending content in someone's own voice for their
+personal Twitter and LinkedIn accounts. Your posts are known for stopping the scroll
+and getting genuine engagement, not just impressions.
 
 YOUR VOICE / STYLE:
 {voice}
@@ -58,20 +61,64 @@ ORIGINAL CONTENT (for inspiration only — do not copy verbatim, extract the cor
 {content}
 ---
 
-Create TWO versions. Be CONCISE — brevity matters more than completeness here.
+Create TWO versions.
 
-1. TWITTER THREAD: A hook tweet (under 200 chars, must grab attention in first line) followed by 2-3 short follow-up tweets that build on the idea. HARD LIMIT: every tweet must be under 260 characters, no exceptions — count carefully before finalizing.
+1. TWITTER THREAD: A hook tweet (under 200 chars, must grab attention in the first
+   line) followed by 2-3 short follow-up tweets that build on the idea. HARD LIMIT:
+   every tweet under 260 characters — count carefully before finalizing.
 
-2. LINKEDIN POST: 120-200 words (shorter is fine), more narrative and reflective tone, can include a personal angle ("I've been thinking about this..." or "This made me reconsider..."), ends with a question or call to engage.
+2. LINKEDIN POST — follow this exact structure, used by high-performing LinkedIn
+   creators:
 
-3. HASHTAGS: 3-5 relevant hashtags that fit both platforms.
+   a) HOOK LINE (critical): The very first line must work as a standalone
+      scroll-stopper, because LinkedIn truncates posts after ~3 lines behind
+      a "see more" button on mobile — most readers decide whether to expand
+      based on this line alone. Use a bold claim, a surprising number, a
+      relatable tension, or a direct question. Never start with "I've been
+      thinking about..." or "Just read an article..." — too soft, gets scrolled past.
 
-IMPORTANT: This is a fresh rewrite in a new voice, not a copy. Extract the underlying idea/insight and re-express it naturally. Do not reuse distinctive phrases from the original. Keep the total response compact — do not pad with extra commentary or alternate versions.
+   b) FORMAT FOR SCANNING, NOT READING: Real LinkedIn posts are NOT solid
+      paragraphs. Break every 1-3 sentences into its own short paragraph,
+      separated by a blank line (use \\n\\n between paragraphs in the JSON
+      string). Never write more than 3 sentences without a break. Short,
+      punchy, one-idea-per-paragraph. This is non-negotiable — a wall of
+      text is the #1 reason posts get ignored.
 
-Respond with ONLY a JSON object, no other text, no markdown formatting:
+   c) BODY: Deliver the actual insight/story in 3-5 short paragraphs following
+      the hook. Include one concrete, specific detail (a number, a result, a
+      moment) — specificity is what makes a post feel authentic instead of
+      generic AI-written content.
+
+   d) SEO-CONSCIOUS LANGUAGE: Naturally include the plain-language terms
+      people actually search for on this topic (e.g. "AI agents", "SaaS
+      pricing", "build in public" — whatever fits the actual topic), instead
+      of only clever/jargon phrasing. This helps the post surface in
+      LinkedIn's own search and in Google results that index public posts.
+      Never force keywords unnaturally — it must still read like a human wrote it.
+
+   e) ENDING: Close with ONE clear, specific, easy-to-answer question that
+      invites a real reply (not a generic "thoughts?"). A good ending
+      question is the single biggest driver of comments, and comments are
+      what LinkedIn's algorithm rewards most.
+
+   Total length: 120-250 words for the body (not counting hashtags).
+
+3. HASHTAGS: 3-5 hashtags, WITHOUT the # symbol in the JSON (just the word,
+   e.g. "AI" not "#AI" — the # gets added automatically later). Mix ONE
+   broad/high-volume tag (e.g. "AI", "SaaS") with 2-4 more specific niche
+   tags relevant to the actual topic (e.g. "AIagents", "IndieHackers",
+   "BuildInPublic") — broad tags for reach, niche tags for the right audience.
+
+IMPORTANT: This is a fresh rewrite in a new voice, not a copy. Extract the
+underlying idea/insight and re-express it naturally. Do not reuse distinctive
+phrases from the original. Keep the total response compact — do not pad with
+extra commentary or alternate versions.
+
+Respond with ONLY a JSON object, no other text, no markdown formatting. The
+linkedin_post value MUST contain literal \\n\\n between paragraphs:
 {{
   "twitter_thread": ["tweet 1 text", "tweet 2 text", "tweet 3 text"],
-  "linkedin_post": "full linkedin post text here",
+  "linkedin_post": "Hook line here.\\n\\nShort paragraph two.\\n\\nShort paragraph three.\\n\\nClosing question here?",
   "hashtags": ["AI", "BuildInPublic", "SaaS"]
 }}
 """

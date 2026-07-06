@@ -178,8 +178,24 @@ def approve_and_post(content_id: int) -> dict:
         logger.warning(msg)
         return {"source": "linkedin_poster", "posted": False, "error": msg}
 
-    linkedin_text = row.get("linkedin_post", "")
-    logger.info(f"Posting #{content_id} to LinkedIn ({len(linkedin_text)} chars)...")
+    linkedin_body = row.get("linkedin_post", "")
+    raw_hashtags  = row.get("hashtags", "") or ""
+
+    # hashtags are stored as a comma-separated string like "AI, SaaS, BuildInPublic"
+    # — this was NEVER being appended to the actual posted content before,
+    # which is why hashtags didn't show up as real clickable #tags on LinkedIn.
+    tag_list = [t.strip().lstrip("#") for t in raw_hashtags.split(",") if t.strip()]
+    hashtag_line = " ".join(f"#{t}" for t in tag_list)
+
+    # Reserve space for the hashtag line so truncation (if ever needed) never
+    # cuts hashtags off — always trim the body first, keep tags intact.
+    MAX_LEN = 3000
+    reserved = len(hashtag_line) + 4   # +4 for the two newlines separating them
+    if len(linkedin_body) + reserved > MAX_LEN:
+        linkedin_body = linkedin_body[: MAX_LEN - reserved - 3] + "..."
+
+    linkedin_text = f"{linkedin_body}\n\n{hashtag_line}" if hashtag_line else linkedin_body
+    logger.info(f"Posting #{content_id} to LinkedIn ({len(linkedin_text)} chars, {len(tag_list)} hashtags)...")
 
     set_approval_status(content_id, "approved")
 
