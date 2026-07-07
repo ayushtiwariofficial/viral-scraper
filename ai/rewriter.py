@@ -25,6 +25,7 @@ from config.settings import REWRITE_BATCH_SIZE, YOUR_VOICE, GEMINI_MODEL
 from data.database import (
     get_queued_posts_without_content, save_rewritten_content,
     get_rewrite_stats, record_rewrite_failure, log_run,
+    reconcile_orphaned_rewrites,
 )
 from datetime import datetime
 
@@ -283,6 +284,14 @@ def rewrite_posts() -> dict:
         log_run(source="ai_rewrite", posts_found=0, posts_new=0,
                 started_at=started_at, error=msg)
         return {"source": "ai_rewrite", "rewritten": 0, "failed": 0, "errors": [msg]}
+
+    # Self-healing safety net: repair any posts left stuck from a previous
+    # run where the content saved successfully but the status update to
+    # 'rewritten' failed transiently. Cheap — only touches truly
+    # inconsistent rows, a no-op the vast majority of runs.
+    repaired = reconcile_orphaned_rewrites()
+    if repaired:
+        logger.info(f"Self-healed {repaired} post(s) stuck from a previous run")
 
     posts = get_queued_posts_without_content(limit=REWRITE_BATCH_SIZE)
     logger.info(f"Found {len(posts)} queued posts to rewrite")

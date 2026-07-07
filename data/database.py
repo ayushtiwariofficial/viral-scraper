@@ -309,15 +309,22 @@ def get_queued_posts_without_content(limit: int = 10, max_attempts: int = 3):
     client = _get_client()
 
     existing = client.table("content_queue").select("raw_post_id").execute()
-    existing_ids = {r["raw_post_id"] for r in existing.data}
+    existing_ids = {r["raw_post_id"] for r in existing.data if r.get("raw_post_id") is not None}
 
+    # Fetch a generously-sized, FIXED window of queued posts rather than
+    # trying to compute an exact "limit + len(existing_ids)" — that
+    # calculation is fragile and easy to get subtly wrong as the table
+    # grows. status='queued' should always be a small working set (it's
+    # the active backlog, not the whole table), so a large fixed cap is
+    # simpler and safer than trying to be precise about it.
+    SAFE_FETCH_CAP = 500
     resp = (
         client.table("raw_posts")
         .select("*")
         .eq("status", "queued")
         .lt("rewrite_attempts", max_attempts)
         .order("id")
-        .limit(limit + len(existing_ids))   # overfetch to account for filtering below
+        .limit(SAFE_FETCH_CAP)
         .execute()
     )
 
@@ -352,8 +359,18 @@ def save_rewritten_content(
     """
     Save AI-rewritten content for a post and mark it 'rewritten'.
     twitter_thread is stored as a JSON array; hashtags as comma-separated.
+
+    This does two separate writes (insert content, then update status) —
+    not a single atomic transaction, since Supabase's REST API doesn't
+    expose multi-statement transactions directly. If the second write
+    ever failed silently, a post's content would exist but its status
+    would stay 'queued' forever, permanently miscounting it as "still
+    needs rewriting" everywhere else in the system. We retry the status
+    update a few times before giving up, and log loudly if it still
+    fails, so this can never happen silently again.
     """
     import json as _json
+    import time as _time
 
     client = _get_client()
     resp = (
@@ -367,8 +384,63 @@ def save_rewritten_content(
         })
         .execute()
     )
-    client.table("raw_posts").update({"status": "rewritten"}).eq("id", raw_post_id).execute()
+
+    # Retry the status update a few times — this is the step that, when it
+    # silently failed before, left content sitting in content_queue with no
+    # way for the rest of the system to know the post was actually done.
+    for attempt in range(3):
+        try:
+            client.table("raw_posts").update({"status": "rewritten"}).eq("id", raw_post_id).execute()
+            break
+        except Exception as e:
+            if attempt == 2:
+                logger.error(
+                    f"Post {raw_post_id}: content saved successfully, but marking it "
+                    f"'rewritten' failed after 3 attempts ({e}). This post will be "
+                    f"auto-repaired by reconcile_orphaned_rewrites() on the next run."
+                )
+            else:
+                _time.sleep(1)
+
     return resp.data[0]["id"] if resp.data else None
+
+
+def reconcile_orphaned_rewrites() -> int:
+    """
+    Self-healing safety net: finds posts that have content in content_queue
+    but whose raw_posts.status never got updated to 'rewritten' (the
+    failure mode save_rewritten_content's retry logic guards against, but
+    can't fully eliminate — e.g. if all 3 retries hit a genuine outage).
+    Fixes their status and returns how many were repaired. Cheap to run
+    every cycle since it only touches truly inconsistent rows.
+    """
+    client = _get_client()
+
+    content_rows = client.table("content_queue").select("raw_post_id").execute()
+    content_ids = {r["raw_post_id"] for r in content_rows.data if r.get("raw_post_id")}
+
+    if not content_ids:
+        return 0
+
+    stuck = (
+        client.table("raw_posts")
+        .select("id")
+        .eq("status", "queued")
+        .in_("id", list(content_ids))
+        .execute()
+    )
+
+    for row in stuck.data:
+        client.table("raw_posts").update({"status": "rewritten"}).eq("id", row["id"]).execute()
+
+    if stuck.data:
+        logger.warning(
+            f"Reconciled {len(stuck.data)} post(s) that had content but were "
+            f"stuck showing status='queued' — this can happen if a status "
+            f"update failed transiently in a previous run."
+        )
+
+    return len(stuck.data)
 
 
 def get_unposted_content(limit: int = 10):
