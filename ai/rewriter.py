@@ -189,7 +189,29 @@ def call_gemini(prompt: str, max_retries: int = MAX_RETRIES) -> dict | None:
 
             # Defensive: strip markdown fences if the model adds them anyway
             cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
-            return json.loads(cleaned)
+            parsed = json.loads(cleaned)
+
+            # CRITICAL: check finish_reason even though parsing SUCCEEDED.
+            # Gemini's constrained JSON mode (responseMimeType=application/json)
+            # can hit the token limit mid-way through a string field's content
+            # and still force a syntactically valid closing (quote + empty
+            # array + closing brace) — producing perfectly parseable JSON with
+            # silently truncated, incomplete content. This exact failure
+            # already reached a real LinkedIn post: mid-sentence cutoff, no
+            # hashtags, no exception ever raised because parsing "succeeded."
+            # A finish_reason of MAX_TOKENS after a successful parse means the
+            # content itself may still be incomplete regardless — treat it as
+            # a failed attempt and retry, exactly like a parse failure would be.
+            if finish_reason == "MAX_TOKENS":
+                logger.warning(
+                    f"Gemini hit MAX_TOKENS (attempt {attempt}) — JSON parsed "
+                    f"successfully but content may be truncated mid-field. "
+                    f"Retrying rather than risk posting incomplete content."
+                )
+                time.sleep(1)
+                continue
+
+            return parsed
 
         except json.JSONDecodeError:
             preview = text[:150] if text else "(no response body)"
@@ -234,7 +256,17 @@ def validate_rewrite(result: dict) -> bool:
         return False   # empty or non-string tweets can't be salvaged
     if not isinstance(post, str) or len(post) < 50:
         return False
-    if not isinstance(tags, list):
+    if not isinstance(tags, list) or len(tags) == 0:
+        # An empty hashtags array is a strong signal of a response that got
+        # cut off mid-generation before reaching this field — a real,
+        # complete rewrite should always produce at least a few tags.
+        return False
+
+    # A post that got truncated mid-sentence (the exact failure that reached
+    # a real LinkedIn post before this check existed) won't end in normal
+    # sentence-ending punctuation. Cheap, effective signal of incomplete content.
+    stripped = post.strip()
+    if stripped and stripped[-1] not in ".!?\"'”’…":
         return False
 
     return True

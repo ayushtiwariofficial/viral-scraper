@@ -246,26 +246,56 @@ def mark_skipped(raw_post_id: int, reason: str = "") -> None:
 def get_top_scored_posts(limit: int = 5, min_score: float = 6.0):
     """
     Fetch the highest-scoring posts that haven't been queued yet.
-    Joins raw_posts + scored_posts, ordered by total_score descending.
+
+    Deliberately avoids filtering on an embedded/joined resource's column
+    (previously: .eq("raw_posts.status", "scored") on a scored_posts query
+    with raw_posts!inner(...) embedded). That pattern is a known tricky
+    area with PostgREST — if the filter isn't applied as strictly as
+    intended, already-processed posts could keep getting re-selected as
+    "top scored" candidates indefinitely, since their scored_posts row
+    would still show a high total_score even after their raw_post moved
+    on to 'queued' or 'rewritten'. This directly matched a real symptom:
+    the same handful of posts kept getting "found" and re-queued every
+    run, which then blocked genuinely new posts from ever being rewritten.
+
+    Instead: fetch the set of raw_post ids that are CURRENTLY 'scored'
+    via a simple, unambiguous single-table query, then only consider
+    scored_posts rows whose raw_post_id is in that set.
     """
     client = _get_client()
+
+    # Simple, unambiguous: which raw_posts are actually still 'scored' right now?
+    still_scored = (
+        client.table("raw_posts")
+        .select("id, source, platform, author, title, content, url, engagement, status")
+        .eq("status", "scored")
+        .execute()
+    )
+    still_scored_map = {r["id"]: r for r in still_scored.data}
+
+    if not still_scored_map:
+        return []
+
+    # Fetch high-scoring candidates — overfetch a bit since some will get
+    # filtered out below if they're no longer actually 'scored'.
     resp = (
         client.table("scored_posts")
-        .select("*, raw_posts!inner(id, source, platform, author, title, content, url, engagement, status)")
-        .eq("raw_posts.status", "scored")
+        .select("*")
         .gte("total_score", min_score)
         .order("total_score", desc=True)
-        .limit(limit)
+        .limit(limit * 5 + 20)   # generous overfetch, cheap and simple
         .execute()
     )
 
-    # Flatten the joined structure to match the old SQLite row shape
     results = []
     for row in resp.data:
-        row = dict(row)
-        rp = row.pop("raw_posts")
-        merged = {**rp, **row}
-        results.append(merged)
+        raw_post_id = row.get("raw_post_id")
+        if raw_post_id in still_scored_map:
+            merged = {**still_scored_map[raw_post_id], **row}
+            results.append(merged)
+        if len(results) >= limit:
+            break
+
     return results
 
 
