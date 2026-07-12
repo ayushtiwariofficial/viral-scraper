@@ -250,17 +250,24 @@ def get_top_scored_posts(limit: int = 5, min_score: float = 6.0):
     Deliberately avoids filtering on an embedded/joined resource's column
     (previously: .eq("raw_posts.status", "scored") on a scored_posts query
     with raw_posts!inner(...) embedded). That pattern is a known tricky
-    area with PostgREST — if the filter isn't applied as strictly as
-    intended, already-processed posts could keep getting re-selected as
-    "top scored" candidates indefinitely, since their scored_posts row
-    would still show a high total_score even after their raw_post moved
-    on to 'queued' or 'rewritten'. This directly matched a real symptom:
-    the same handful of posts kept getting "found" and re-queued every
-    run, which then blocked genuinely new posts from ever being rewritten.
+    area with PostgREST.
+
+    CRITICAL SECOND GUARD: even with the direct status='scored' check below,
+    a real incident showed posts that had ALREADY been fully rewritten
+    weeks earlier getting re-selected here again — their raw_posts.status
+    had somehow drifted back to 'scored'. Relying on status alone as the
+    single source of truth is fragile. So this function ALSO explicitly
+    excludes any raw_post_id that already has a content_queue row, full
+    stop, regardless of what its status field currently says. A post that
+    already has generated content should NEVER be treated as a fresh
+    candidate again — that's true no matter what caused the status drift,
+    and this guard makes the whole pipeline resilient to that class of
+    bug instead of depending on fully understanding its root cause.
 
     Instead: fetch the set of raw_post ids that are CURRENTLY 'scored'
     via a simple, unambiguous single-table query, then only consider
-    scored_posts rows whose raw_post_id is in that set.
+    scored_posts rows whose raw_post_id is in that set AND has no
+    existing content_queue entry.
     """
     client = _get_client()
 
@@ -276,8 +283,14 @@ def get_top_scored_posts(limit: int = 5, min_score: float = 6.0):
     if not still_scored_map:
         return []
 
+    # Hard exclusion: never re-select a post that already has content,
+    # no matter what its status field claims.
+    already_has_content = client.table("content_queue").select("raw_post_id").execute()
+    already_processed_ids = {r["raw_post_id"] for r in already_has_content.data if r.get("raw_post_id")}
+
     # Fetch high-scoring candidates — overfetch a bit since some will get
-    # filtered out below if they're no longer actually 'scored'.
+    # filtered out below if they're no longer actually 'scored' or already
+    # have content.
     resp = (
         client.table("scored_posts")
         .select("*")
@@ -290,7 +303,7 @@ def get_top_scored_posts(limit: int = 5, min_score: float = 6.0):
     results = []
     for row in resp.data:
         raw_post_id = row.get("raw_post_id")
-        if raw_post_id in still_scored_map:
+        if raw_post_id in still_scored_map and raw_post_id not in already_processed_ids:
             merged = {**still_scored_map[raw_post_id], **row}
             results.append(merged)
         if len(results) >= limit:
@@ -615,6 +628,26 @@ def get_all_content_queue() -> list:
         row["author"] = rp.get("author")
         rows.append(row)
     return rows
+
+
+def get_pending_unposted_content() -> list:
+    """
+    Fetch content_queue rows not yet posted anywhere and not already
+    rejected — used by --audit-queue to re-check older content against
+    the current (possibly stricter) validation rules. Content generated
+    before a validation fix was deployed never gets automatically
+    re-checked otherwise, since validation only runs at creation time.
+    """
+    client = _get_client()
+    resp = (
+        client.table("content_queue")
+        .select("*")
+        .eq("posted_linkedin", 0)
+        .eq("posted_twitter", 0)
+        .neq("approval_status", "rejected")
+        .execute()
+    )
+    return resp.data
 
 
 # ── LinkedIn OAuth token storage (Posts API — replaces Playwright) ────

@@ -205,10 +205,47 @@ def main():
         "--mark-twitter-posted", type=int, metavar="ID",
         help="Mark a content_queue ID as manually posted to Twitter (Twitter posting is manual — see settings.py)"
     )
+    parser.add_argument(
+        "--audit-queue", action="store_true",
+        help="Re-check all pending (unposted) content against the CURRENT validation "
+             "rules and auto-reject anything that fails. Use this after a validation "
+             "fix ships, since older content generated before the fix was never "
+             "automatically re-checked against it."
+    )
     args = parser.parse_args()
 
     # Always init DB first
     init_db()
+
+    if args.audit_queue:
+        from data.database import get_pending_unposted_content, set_approval_status
+        from ai.rewriter import validate_rewrite
+        import json as _json
+
+        rows = get_pending_unposted_content()
+        print(f"Auditing {len(rows)} pending post(s) against current validation rules...\n")
+
+        rejected_count = 0
+        for row in rows:
+            try:
+                thread = _json.loads(row.get("twitter_thread") or "[]")
+            except Exception:
+                thread = []
+            candidate = {
+                "twitter_thread": thread,
+                "linkedin_post": row.get("linkedin_post", ""),
+                "hashtags": [t.strip() for t in (row.get("hashtags") or "").split(",") if t.strip()],
+            }
+            if not validate_rewrite(candidate):
+                set_approval_status(row["id"], "rejected")
+                rejected_count += 1
+                preview = (row.get("linkedin_post") or "")[:70]
+                print(f"  ✗ Rejected #{row['id']}: {preview}...")
+
+        print(f"\nDone — {rejected_count} of {len(rows)} pending post(s) rejected for failing "
+              f"current validation (incomplete content, missing hashtags, etc.)")
+        print("Everything else in the queue passed and is still available for approval.")
+        return
 
     if args.list:
         from data.database import get_all_content_queue
